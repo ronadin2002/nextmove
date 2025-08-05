@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleExecutable</key>
+    <string>nextmove-2</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.pasteRecall.app</string>
+    <key>CFBundleName</key>
+    <string>PasteRecall</string>
+    <key>CFBundleVersion</key>
+    <string>1.0</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSSupportsAutomaticTermination</key>
+    <false/>
+    <key>NSSupportsSuddenTermination</key>
+    <false/>
+    <key>LSBackgroundOnly</key>
+    <false/>
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsArbitraryLoads</key>
+        <true/>
+    </dict>
+    <key>NSSystemAdministrationUsageDescription</key>
+    <string>PasteRecall needs system access to detect the CMD+G hotkey globally for AI writing assistance.</string>
+    <key>NSAccessibilityUsageDescription</key>
+    <string>PasteRecall needs accessibility access to detect global hotkeys and provide AI writing assistance.</string>
+</dict>
+</plist> 

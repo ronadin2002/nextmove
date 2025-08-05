@@ -1,0 +1,30 @@
+# Swift Package Manager
+/.build
+/Packages
+Package.resolved
+
+# Xcode
+xcuserdata/
+*.xcworkspace
+DerivedData/
+
+# macOS
+.DS_Store
+
+# Log files
+*.jsonl
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# Environment files (contains API keys)
+.env
+
+# API keys and secrets
+*.key
+secrets.txt
+
+# Compiled app bundle (may contain embedded secrets)
+PasteRecall.app/Contents/MacOS/
