@@ -8,7 +8,9 @@ struct LLMSuggestion: Codable {
 }
 
 struct LLMResponse: Codable {
-    let suggestions: [LLMSuggestion]
+    let suggestions: [LLMSuggestion]?
+    let text: String?
+    let confidence: Float?
 }
 
 @available(macOS 12.3, *)
@@ -18,17 +20,14 @@ final class LLMService {
     private let session = URLSession.shared
     
     init() {
-        // Get API key from environment variable for security
-        if let envApiKey = ProcessInfo.processInfo.environment["OPENAI_API_KEY"] {
-            self.apiKey = envApiKey
+        // For production, use environment variable: OPENAI_API_KEY
+        if let envKey = ProcessInfo.processInfo.environment["OPENAI_API_KEY"], !envKey.isEmpty {
+            self.apiKey = envKey
+            print("🤖 OpenAI LLM service initialized with environment API key")
         } else {
-            // Fallback for local development - user must set their own key
-            print("⚠️  Please set OPENAI_API_KEY environment variable")
-            print("   export OPENAI_API_KEY='your-key-here'")
-            self.apiKey = "REPLACE_WITH_YOUR_OPENAI_API_KEY"
+            self.apiKey = ""
+            print("⚠️ OPENAI_API_KEY not set. LLM calls will be skipped; using mock suggestions.")
         }
-        
-        print("🤖 Enhanced LLM service initialized with anti-hallucination filters")
     }
     
     // Main function to get text suggestions from LLM
@@ -192,6 +191,9 @@ final class LLMService {
     
     // Call OpenAI API with improved error handling
     private func callOpenAI(prompt: String) async throws -> [LLMSuggestion] {
+        guard !apiKey.isEmpty else {
+            throw LLMError.noAPIKey
+        }
         let requestBody: [String: Any] = [
             "model": "gpt-4o-mini",
             "messages": [
@@ -247,7 +249,14 @@ final class LLMService {
         }
         
         let llmResponse = try JSONDecoder().decode(LLMResponse.self, from: contentData)
-        return llmResponse.suggestions
+        if let suggestions = llmResponse.suggestions, !suggestions.isEmpty {
+            return suggestions
+        }
+        if let text = llmResponse.text, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let conf = llmResponse.confidence ?? 0.7
+            return [LLMSuggestion(text: text, confidence: conf, type: "completion", source: "single")]
+        }
+        throw LLMError.invalidJSON
     }
     
     // NEW: Enhanced system prompt with stronger anti-hallucination rules
