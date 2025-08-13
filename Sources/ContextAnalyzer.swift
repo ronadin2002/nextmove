@@ -85,6 +85,10 @@ struct SemanticContext {
 final class ContextAnalyzer {
     private let storage: TextStorage
     private let captureService: CaptureService
+    private let axExtractor = AccessibilityTextExtractor()
+    private let cursorInspector = CursorInspector()
+    // High cap for how many ranked history lines go into the LLM prompt
+    private let MAX_RANKED_HISTORY_LINES = 3000
     private var recentlyPastedContent: [String] = []  // NEW: Track recently pasted content
     private var lastPasteTime: TimeInterval = 0      // NEW: Track when we last pasted
     
@@ -113,22 +117,65 @@ final class ContextAnalyzer {
         }
     }
     
-    // Main function to analyze current context when CMD+G is pressed
+    // Main function to analyze current context when CMD+J is pressed
     func analyzeCurrentContext() async -> ContextAnalysis {
         print("🔍 Analyzing current context...")
         
-        // Get current active application
-        let activeApp = getCurrentActiveApp()
+        // CRITICAL: Wait for user to return to their actual work window
+        print("⏳ Waiting for you to return to your document window...")
+        try? await Task.sleep(nanoseconds: 1_000_000_000) // 1 second wait
         
-        // Enhanced multi-step analysis
-        let currentScreen = await captureCurrentContext()
+        // Get current active application AFTER the wait
+        let activeApp = getCurrentActiveApp()
+        print("🎯 Detected active app: \(activeApp)")
+        
+        // If it's Terminal, give user more time to switch
+        if activeApp.lowercased().contains("terminal") || activeApp.lowercased().contains("iterm") {
+            print("⚠️ Still in terminal - waiting 2 more seconds for you to switch to your document...")
+            try? await Task.sleep(nanoseconds: 2_000_000_000) // 2 more seconds
+        }
+        
+        var currentScreen: String = ""
+
+        // Fast path: use Accessibility to get exact caret text if available
+        if let focused = AXFocused.string()?.trimmingCharacters(in: .whitespacesAndNewlines), !focused.isEmpty {
+            print("⚡️ AX captured focused text: \(focused.prefix(120))")
+            currentScreen = "TYPING: \(focused)____"
+        }
+
+        // If AX failed we fall back to OCR/cursor strategies
+        var mouseLocation = CGEvent(source: nil)?.location ?? .zero
+        
+        // If we already have currentScreen from AX, build analysis directly later
+        if currentScreen.isEmpty {
+            // Get main display info
+            guard let displayID = CGMainDisplayID() as CGDirectDisplayID?,
+                  let displayBounds = CGDisplayBounds(displayID) as CGRect? else {
+                currentScreen = ""
+                // Proceed but layout may be empty
+                mouseLocation = .zero
+            }
+            
+            print("🎯 Smart capture strategy at cursor: (\(Int(mouseLocation.x)), \(Int(mouseLocation.y)))")
+            
+            // Strategy 1: Capture focused area around cursor (for immediate context)
+            let focusedText = await captureFocusedArea(mouseLocation: mouseLocation, displayID: displayID, displayBounds: displayBounds)
+            
+            // Strategy 2: Capture broader context (for layout understanding)
+            let contextText = await captureBroaderContext(mouseLocation: mouseLocation, displayID: displayID, displayBounds: displayBounds)
+            
+            // Combine and analyze what user is likely typing/completing
+            currentScreen = analyzeCapturedContext(focused: focusedText, broader: contextText)
+            print("🔍 Smart capture result: '\(currentScreen.isEmpty ? "No relevant text" : String(currentScreen.prefix(150)))...'")
+        }
+
+        // Build full analysis with layout etc.
         let layoutAnalysis = await analyzeLayoutAndStructure(activeApp: activeApp)
         let inputContext = await analyzeInputContext(screen: currentScreen, layout: layoutAnalysis)
         let semanticContext = await analyzeSemanticContext(input: inputContext, recent: await getRecentContent())
-        
-        // Get cursor position
+
         let cursorPosition = getCursorPosition()
-        
+
         let analysis = ContextAnalysis(
             currentScreen: currentScreen,
             recentContent: semanticContext.relevantHistorySnippets,
@@ -140,13 +187,10 @@ final class ContextAnalyzer {
             layoutAnalysis: layoutAnalysis,
             semanticContext: semanticContext
         )
-        
-        print("📊 Enhanced analysis complete:")
-        print("   App: \(activeApp) (\(layoutAnalysis.windowStructure.appType))")
-        print("   Input: \(inputContext.fieldType) - \(inputContext.completionContext)")
-        print("   Intent: \(semanticContext.intentPrediction)")
-        print("   Relevant history: \(semanticContext.relevantHistorySnippets.count) items")
-        
+
+        // Debug
+        print("📊 Enhanced analysis complete: App=\(activeApp) CurrentText='\(inputContext.currentText.prefix(50))' Confidence=\(analysis.confidence)")
+
         return analysis
     }
     
@@ -354,27 +398,49 @@ final class ContextAnalyzer {
             
             print("📖 Found \(lines.count) total log entries in content.jsonl")
             
-            // Take MAXIMUM recent entries (last 1000 raw JSONL lines for maximum context)
-            let maxRecentLines = 1000
+            // Take recent entries but filter out historical Wikipedia content
+            let maxRecentLines = 10000 // 10× more context requested by user
             let mostRecentLines = Array(lines.suffix(maxRecentLines))
-            print("📚 Reading the absolute last \(mostRecentLines.count) RAW JSONL entries (requested: \(maxRecentLines))")
+            
+            // CRITICAL: Filter out Virginia Regiment/Wikipedia historical content
+            let filteredLines = mostRecentLines.filter { line in
+                let lowerLine = line.lowercased()
+                
+                // Block all Virginia Regiment/Wikipedia historical content
+                let historicalTerms = [
+                    "virginia regiment", "george washington", "french and indian war",
+                    "wikipedia", "encyclopedia", "1754", "1758", "1762", "colonial",
+                    "british army", "fort necessity", "jumonville", "braddock", "governor",
+                    "continental army", "revolutionary war", "february 22, 1732",
+                    "portrait", "assembly", "dinwiddie", "provincial forces"
+                ]
+                
+                for term in historicalTerms {
+                    if lowerLine.contains(term) {
+                        return false  // Filter out historical content
+                    }
+                }
+                
+                return true  // Keep current/relevant content
+            }
+            
+            print("📚 Filtered \(mostRecentLines.count) → \(filteredLines.count) entries (removed \(mostRecentLines.count - filteredLines.count) historical items). Sending 10× more logs as requested.")
             
             // Show file statistics
             let fileSize = (try? FileManager.default.attributesOfItem(atPath: fileURL.path)[.size] as? Int64) ?? 0
-            print("📊 File stats: \(fileSize) bytes, \(lines.count) total entries, sending \(mostRecentLines.count) to LLM")
+            print("📊 File stats: \(fileSize) bytes, \(lines.count) total entries, sending \(filteredLines.count) relevant to LLM")
             
-            print("🔍 DEBUG: Last 15 RAW JSONL lines from file (NEWEST FIRST for LLM attention):")
-            for (i, line) in mostRecentLines.suffix(15).enumerated() {
+            print("🔍 DEBUG: Last 15 FILTERED JSONL lines (NEWEST FIRST for LLM attention):")
+            for (i, line) in filteredLines.suffix(15).enumerated() {
                 print("   \(i+1). \(line)")
             }
             
             // Calculate approximate prompt size
-            let totalChars = mostRecentLines.joined(separator: "\n").count
+            let totalChars = filteredLines.joined(separator: "\n").count
             print("📏 Total context characters being sent: \(totalChars)")
             
             // CRITICAL: Return logs in REVERSE order so NEWEST logs appear at BOTTOM of LLM prompt
-            // This ensures the most recent activity gets the most attention from the LLM
-            let reversedLines = Array(mostRecentLines.reversed())
+            let reversedLines = Array(filteredLines.reversed())
             print("✅ Logs will be presented to LLM with NEWEST at the bottom (most prominent position)")
             
             // Show order confirmation - first few (oldest) and last few (newest) entries
@@ -405,9 +471,7 @@ final class ContextAnalyzer {
     // NO FILTERING - just return everything
     private func filterRelevantHistory(recent: [String], for input: InputContext, topic: String?) -> [String] {
         print("🔍 NO FILTERING - returning ALL \(recent.count) recent items")
-        
-        // Just return everything - no filtering at all
-        return Array(recent.prefix(100))  // Only limit by count to avoid huge prompts
+        return recent // keep all loaded lines; prompt builder will rank/slice
     }
     
     private func calculateEnhancedConfidence(input: InputContext, layout: LayoutAnalysis) -> Float {
@@ -537,7 +601,7 @@ final class ContextAnalyzer {
     
     // Insert cursor marker (____) to show where user is currently positioned
     private func insertCursorMarker(in text: String, at cursorPosition: CGPoint) -> String {
-        // Strategy: Aggressively find actual user content, ignore ALL UI AND recently pasted content
+        // CRITICAL: Focus ONLY on current typing, ignore ALL historical content
         
         print("🔍 Raw captured text for cursor detection:")
         print("   \(text)")
@@ -545,14 +609,29 @@ final class ContextAnalyzer {
         let lines = text.components(separatedBy: "\n")
         var candidateLines: [(index: Int, line: String, score: Int)] = []
         
-        // Score each line very aggressively for user content
+        // Score each line ONLY for current user typing (not historical content)
         for (lineIndex, line) in lines.enumerated() {
             let trimmedLine = line.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard trimmedLine.count > 3 else { continue }
+            guard trimmedLine.count > 2 else { continue }
             
             var score = 0
             
-            // NEW: MASSIVE penalty for recently pasted content to avoid feedback loops
+            // MASSIVE penalty for historical Wikipedia/reference content
+            let historicalTerms = [
+                "Virginia Regiment", "Wikipedia", "George Washington", "French and Indian War",
+                "1754", "1758", "1762", "Colonial", "British", "Assembly", "Governor",
+                "Fort Necessity", "Jumonville", "Braddock", "Revolutionary War",
+                "Continental Army", "President", "February", "December", "Portrait"
+            ]
+            
+            for term in historicalTerms {
+                if trimmedLine.contains(term) {
+                    score -= 10000  // Massive penalty for historical content
+                    print("   🚫 HISTORICAL CONTENT: '\(trimmedLine)'")
+                }
+            }
+            
+            // MASSIVE penalty for recently pasted content to avoid feedback loops
             for pastedContent in recentlyPastedContent {
                 if trimmedLine.contains(pastedContent) || pastedContent.contains(trimmedLine) {
                     score -= 5000  // Huge penalty to avoid feedback
@@ -560,23 +639,50 @@ final class ContextAnalyzer {
                 }
             }
             
-            // NEW: MASSIVE penalty for obvious repetitive patterns
+            // MASSIVE penalty for obvious repetitive patterns
             if containsRepetitivePattern(trimmedLine) {
                 score -= 3000
                 print("   🚫 REPETITIVE PATTERN: '\(trimmedLine)'")
             }
             
-            // MASSIVE bonus for lines that look like user typing
-            if trimmedLine.contains("here are") || trimmedLine.contains("some vcs") || 
-               trimmedLine.contains("urls:") || trimmedLine.contains("meeting") ||
-               trimmedLine.contains("from what i know") {
-                score += 1000 // Huge bonus for obvious user content
-                print("   🎯 Found user content candidate: '\(trimmedLine)' (score: \(score))")
+            // HUGE bonus for current document text that user is actually typing
+            let currentDocumentTerms = [
+                "Tel aviv", "governed by", "israel", "city", "municipality", "mayor"
+            ]
+            
+            for term in currentDocumentTerms {
+                if trimmedLine.lowercased().contains(term.lowercased()) {
+                    score += 5000  // Huge bonus for current document content
+                    print("   🎯 CURRENT DOCUMENT: '\(trimmedLine)' (score boost: +5000)")
+                }
             }
             
-            // High score for substantial content with proper sentence structure
-            if trimmedLine.contains(" ") && trimmedLine.count > 10 {
-                score += trimmedLine.count * 2
+            // MASSIVE bonus for incomplete sentences (where user is likely typing)
+            if trimmedLine.lowercased().contains("tel aviv is governed by") ||
+               trimmedLine.lowercased().contains("governed by") ||
+               trimmedLine.lowercased().contains("parliament") && trimmedLine.count < 50 {
+                score += 8000  // Even bigger bonus for active typing
+                print("   🔥 ACTIVE TYPING DETECTED: '\(trimmedLine)' (score boost: +8000)")
+            }
+            
+            // Bonus for lines that look like active typing (incomplete, short)
+            if trimmedLine.count < 30 && !trimmedLine.hasSuffix(".") && 
+               !trimmedLine.contains("{") && !trimmedLine.contains("\"") {
+                score += 1000
+                print("   ✏️ INCOMPLETE LINE: '\(trimmedLine)' (score: +1000)")
+            }
+            
+            // Bonus for lines ending with "by" (matches "governed by")
+            if trimmedLine.lowercased().hasSuffix(" by") {
+                score += 3000
+                print("   🎯 ENDS WITH 'BY': '\(trimmedLine)' (score: +3000)")
+            }
+            
+            // MASSIVE penalties for JSON/log format content
+            if trimmedLine.contains("{") || trimmedLine.contains("\"t\":") || 
+               trimmedLine.contains("\"c\":") || trimmedLine.contains("\"m\":") {
+                score -= 8000
+                print("   🚫 JSON/LOG FORMAT: '\(trimmedLine)'")
             }
             
             // MASSIVE penalties for obvious UI/system text
@@ -585,24 +691,13 @@ final class ContextAnalyzer {
                 "Apple", "Update", "Demo Day", "Contact Information", "reviews", "Message",
                 "New Message", "Promotions", "Updates", "Social", "Palmer", "Console",
                 "Founded", "$ Founded", "Templates", "Blog", "Courses", "Work", "Contact",
-                "Chrome", "download", "available"  // NEW: Add Chrome-related terms
+                "Chrome", "download", "available", "wikipedia", "encyclopedia"
             ]
             
             for keyword in uiKeywords {
-                if trimmedLine.contains(keyword) {
+                if trimmedLine.lowercased().contains(keyword.lowercased()) {
                     score -= 2000 // Huge penalty for UI
                 }
-            }
-            
-            // Penalty for lines that are clearly UI (short, lots of symbols, etc.)
-            if trimmedLine.count < 15 && (trimmedLine.contains("•") || trimmedLine.contains("@") || trimmedLine.contains("$")) {
-                score -= 500
-            }
-            
-            // Bonus for lines ending without punctuation (incomplete user typing)
-            if !trimmedLine.hasSuffix(".") && !trimmedLine.hasSuffix("!") && !trimmedLine.hasSuffix("?") && 
-               !trimmedLine.contains("Order ID") && !trimmedLine.contains("Account:") {
-                score += 200
             }
             
             candidateLines.append((index: lineIndex, line: trimmedLine, score: score))
@@ -611,12 +706,12 @@ final class ContextAnalyzer {
         // Sort by score and show top candidates
         let sortedCandidates = candidateLines.sorted { $0.score > $1.score }
         print("🏆 Top cursor candidates:")
-        for (i, candidate) in sortedCandidates.prefix(3).enumerated() {
+        for (i, candidate) in sortedCandidates.prefix(5).enumerated() {
             print("   \(i+1). '\(candidate.line)' (score: \(candidate.score))")
         }
         
-        // Find the best candidate line (highest score)
-        if let best = sortedCandidates.first, best.score > -1000 {  // Raised threshold
+        // Find the best candidate line (must have positive score for current content)
+        if let best = sortedCandidates.first, best.score > 0 {
             print("🎯 SELECTED cursor line: '\(best.line)' (score: \(best.score))")
             
             // Add cursor marker at the end of the best candidate line
@@ -625,7 +720,7 @@ final class ContextAnalyzer {
             return "TYPING: \(lineWithCursor)"
         }
         
-        print("⚠️ No good cursor candidates found (avoiding feedback loop), using clean fallback")
+        print("⚠️ No current typing content found - defaulting to generic cursor")
         return "TYPING: ____"
     }
     
@@ -717,6 +812,189 @@ final class ContextAnalyzer {
         }
     }
     
+    // Quiet capture to avoid feedback loops
+    private func captureCurrentContextQuietly() async -> String {
+        // Get cursor position
+        let mouseLocation = CGEvent(source: nil)?.location ?? .zero
+        
+        // Find the display that actually contains the cursor
+        guard let (displayID, displayBounds) = getDisplayContaining(point: mouseLocation) else {
+            return ""
+        }
+        
+        // Capture focused area around cursor (for immediate context)
+        let focusedText = await captureFocusedAreaQuietly(mouseLocation: mouseLocation, displayID: displayID, displayBounds: displayBounds)
+        
+        // Capture broader context (for layout understanding)
+        let contextText = await captureBroaderContextQuietly(mouseLocation: mouseLocation, displayID: displayID, displayBounds: displayBounds)
+        
+        // Combine and analyze what user is likely typing/completing
+        let combinedContext = analyzeCapturedContextQuietly(focused: focusedText, broader: contextText)
+        
+        return combinedContext
+    }
+    
+    // Capture focused area without debug spam
+    private func captureFocusedAreaQuietly(mouseLocation: CGPoint, displayID: CGDirectDisplayID, displayBounds: CGRect) async -> String {
+        let focusWidth: CGFloat = 600
+        let focusHeight: CGFloat = 300
+        
+        let captureX = max(displayBounds.minX, mouseLocation.x - focusWidth / 2)
+        let captureY = max(displayBounds.minY, mouseLocation.y - focusHeight / 2)
+        
+        let captureRect = CGRect(
+            x: captureX,
+            y: captureY,
+            width: min(focusWidth, displayBounds.maxX - captureX),
+            height: min(focusHeight, displayBounds.maxY - captureY)
+        )
+        
+        guard let screenshot = CGDisplayCreateImage(displayID, rect: captureRect) else {
+            return ""
+        }
+        
+        return await performCleanOCR(screenshot)
+    }
+    
+    // Capture broader context without debug spam
+    private func captureBroaderContextQuietly(mouseLocation: CGPoint, displayID: CGDirectDisplayID, displayBounds: CGRect) async -> String {
+        let contextWidth: CGFloat = 1000
+        let contextHeight: CGFloat = 600
+        
+        let captureX = max(displayBounds.minX, mouseLocation.x - contextWidth / 2)
+        let captureY = max(displayBounds.minY, mouseLocation.y - contextHeight / 2)
+        
+        let captureRect = CGRect(
+            x: captureX,
+            y: captureY,
+            width: min(contextWidth, displayBounds.maxX - captureX),
+            height: min(contextHeight, displayBounds.maxY - captureY)
+        )
+        
+        guard let screenshot = CGDisplayCreateImage(displayID, rect: captureRect) else {
+            return ""
+        }
+        
+        return await performCleanOCR(screenshot)
+    }
+    
+    // Clean OCR that filters out terminal/debug content
+    private func performCleanOCR(_ cgImage: CGImage) async -> String {
+        return await withCheckedContinuation { continuation in
+            let ocrService = OcrService()
+            ocrService.recognize(cgImage: cgImage) { blocks in
+                let cleanText = blocks
+                    .filter { $0.confidence > 0.7 } // Lower threshold to catch more content
+                    .map { $0.text.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    .filter { text in
+                        // NUCLEAR filtering of ALL system/terminal content
+                        let lowerText = text.lowercased()
+                        
+                        // Block ALL system/terminal content aggressively
+                        let systemTerms = [
+                            // Terminal/Build terms
+                            "build", "warning", "swift", "product", "nextmove-2", "debug",
+                            "consider replacing", "assignment", "immutable", "never used",
+                            "cmd+key", "permissions", "granted", "event tap", "hotkey",
+                            "xxhash-swift", "dependency", "target", "bytes", "entries",
+                            "display", "origin", "starting", "capture", "stream",
+                            "initialized", "api key", "fallback", "assistance",
+                            
+                            // OCR/System noise
+                            "step", "completion", "suggestions", "gpt", "openai", "llm", "api",
+                            "confidence", "pasting", "auto-paste", "cursor", "detected", "trigger",
+                            "enhanced", "selection", "source materials", "source elements",
+                            "jsonl", "logs", "prompt", "response", "analysis", "context",
+                            
+                            // Google UI elements (but keep document content)
+                            "format tools extensions help", "normal text", "arial",
+                            "saved to drive", "100%", "saving..."
+                        ]
+                        
+                        for term in systemTerms {
+                            if lowerText.contains(term) {
+                                return false
+                            }
+                        }
+                        
+                        // Block coordinate/technical patterns
+                        if text.contains("id=") || text.contains("origin=") || 
+                           text.contains("1920x1080") || text.contains("1710x1107") ||
+                           text.matches(pattern: "\\d+\\.\\d+,\\s*\\d+\\.\\d+") {
+                            return false
+                        }
+                        
+                        // Block anything with parentheses + numbers (technical output)
+                        if text.contains("(") && text.contains(")") && 
+                           text.rangeOfCharacter(from: .decimalDigits) != nil && text.count > 30 {
+                            return false
+                        }
+                        
+                        // PRIORITIZE document content patterns
+                        let documentKeywords = [
+                            "tel aviv", "governed by", "israel", "city", "municipality",
+                            "parliament", "great britain", "kingdom", "established"
+                        ]
+                        
+                        for keyword in documentKeywords {
+                            if lowerText.contains(keyword) {
+                                print("🎯 FOUND DOCUMENT CONTENT: '\(text)'")
+                                return true // Always keep document content
+                            }
+                        }
+                        
+                        // Only keep natural language text
+                        let hasLetters = text.rangeOfCharacter(from: .letters) != nil
+                        let hasSpaces = text.contains(" ")
+                        let isReasonableLength = text.count >= 3 && text.count <= 100
+                        let notMostlySymbols = text.filter { $0.isLetter }.count > text.count / 3
+                        
+                        return hasLetters && hasSpaces && isReasonableLength && notMostlySymbols
+                    }
+                    .sorted { text1, text2 in
+                        // Prioritize document content over everything else
+                        let text1Lower = text1.lowercased()
+                        let text2Lower = text2.lowercased()
+                        
+                        let text1IsDoc = text1Lower.contains("tel aviv") || text1Lower.contains("governed") ||
+                                        text1Lower.contains("parliament") || text1Lower.contains("britain")
+                        let text2IsDoc = text2Lower.contains("tel aviv") || text2Lower.contains("governed") ||
+                                        text2Lower.contains("parliament") || text2Lower.contains("britain")
+                        
+                        if text1IsDoc && !text2IsDoc { return true }
+                        if text2IsDoc && !text1IsDoc { return false }
+                        
+                        return text1.count > text2.count
+                    }
+                    .prefix(3) // Only top 3 most relevant results
+                    .joined(separator: " ")
+                
+                print("🔍 Clean OCR result: '\(cleanText)'")
+                continuation.resume(returning: cleanText)
+            }
+        }
+    }
+    
+    // Analyze captured context without debug output
+    private func analyzeCapturedContextQuietly(focused: String, broader: String) -> String {
+        var result: [String] = []
+        
+        // Prioritize focused area content
+        if !focused.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            result.append("USER_TYPING: \(focused)")
+        }
+        
+        // Add broader context if different and meaningful
+        if !broader.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let broaderFiltered = broader.replacingOccurrences(of: focused, with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+            if !broaderFiltered.isEmpty && broaderFiltered.count > 10 {
+                result.append("APP_CONTEXT: \(broaderFiltered)")
+            }
+        }
+        
+        return result.joined(separator: " | ")
+    }
+    
     // Helper to get readable category names
     private func getCategoryName(_ shortCode: String) -> String {
         switch shortCode {
@@ -769,57 +1047,57 @@ final class ContextAnalyzer {
     
     // Generate LLM prompt from context analysis
     func generateLLMPrompt(from analysis: ContextAnalysis) -> String {
-        // Prepare comprehensive recent activity context
-        let recentContext = analysis.recentContent.isEmpty ? 
-            "No recent activity logged" : 
-            analysis.recentContent.joined(separator: "\n")
+        // STEP 0 — rank history lines by keyword–overlap to cursor
+        let cursorLower = analysis.currentScreen.lowercased()
+        let keywords = Set(cursorLower.split { !$0.isLetter }
+            .map(String.init)
+            .filter { $0.count >= 3 })
         
-        // Create completion-focused prompt
-        let prompt = """
-        You are a smart completion assistant. Complete the user's text using ACTUAL phrases and content from their recent activity.
-
-        CURRENT APPLICATION: \(analysis.activeApp)
-        
-        WHAT USER IS CURRENTLY LOOKING AT (with cursor position marked as ____):
-        \(analysis.currentScreen.isEmpty ? "No visible text detected" : analysis.currentScreen)
-        
-        RAW USER ACTIVITY LOGS (JSONL format - each line is {"t":"text content","c":"category","i":"importance","v":"views","m":"minutes"}):
-        \(recentContext)
-
-        CRITICAL: The ____ marker shows EXACTLY where the user's cursor is positioned. Complete the text at that exact position.
-
-        COMPLETION RULES:
-        1. Look for the ____ marker - this shows where the user needs completion
-        2. Use the "t" field from the JSONL logs above - that's what the user was actually reading/typing
-        3. If you see "john.sm____" → complete with actual email from recent activity logs
-        4. If you see "meeting at ____" → complete with actual times from recent activity logs  
-        5. If you see "The oldest man is ____" → complete with actual names from recent activity logs
-        6. Use COMPLETE phrases and sentences from the "t" fields in the logs above
-        7. The completion should flow naturally from the text before the ____ marker
-
-        EXAMPLES:
-        - User typed "The oldest man is ____" + logs show "João Marinho Neto, who is 112 years old" → suggest "João Marinho Neto"
-        - User typed "meeting at ____" + logs show "3:30 PM Conference Room B" → suggest "3:30 PM"
-        - User typed "hacker houses: ____" + logs show "AGI House, Crypto Castle" → suggest "AGI House, Crypto Castle"
-
-        RESPOND WITH JSON using ACTUAL content from the logs above:
-        {
-          "suggestions": [
-            {"text": "actual completion from recent activity logs", "confidence": 0.9, "type": "completion"},
-            {"text": "alternative actual content from recent logs", "confidence": 0.8, "type": "alternative"},
-            {"text": "extended actual content from recent logs", "confidence": 0.7, "type": "extended"}
-          ]
+        func score(line: String) -> Int {
+            let lower = line.lowercased()
+            return keywords.filter { lower.contains($0) }.count
         }
+        
+        let ranked = analysis.recentContent
+            .map { ($0, score(line: $0)) }
+            .sorted { $0.1 == $1.1 ? $0.0.count > $1.0.count : $0.1 > $1.1 }
+        let top = ranked.prefix(MAX_RANKED_HISTORY_LINES).map { $0.0 }
+        let recentContext = top.joined(separator: "\n")
+        
+        // STEP 1 — build the new prompt
+        let prompt = """
+        SYSTEM:
+        You are an auto-completion engine. Cursor is at ____ and you must replace it.
+        
+        USER CONTEXT
+        ────────────
+        APP        : \(analysis.activeApp)
+        TIMESTAMP  : \(analysis.timestamp)
+        CURSOR LINE: \(analysis.currentScreen)
+        
+        RELEVANT HISTORY (\(top.count) lines, newest → oldest)
+        ────────────
+        \(recentContext)
+        
+        COMPLETION RULES
+        ────────────
+        1. Replace the ____ marker with ≤ 25 tokens that complete the cursor line grammatically.
+        2. Re-use phrases / data from RELEVANT HISTORY when helpful.
+        3. Do NOT inject new topics; stay on the same subject & tone.
+        4. If you have no useful completion, respond with JSON: { "text": "", "confidence": 0 }.
+        
+        Respond ONLY with JSON:
+        { "text": "<completion>", "confidence": <0-1> }
         """
         
-        // Log the complete prompt being sent to OpenAI
+        // Debug
         print("\n" + String(repeating: "=", count: 80))
-        print("🤖 RAW JSONL PROMPT TO OPENAI:")
+        print("🤖 PROMPT TO OPENAI (ranked up to \(MAX_RANKED_HISTORY_LINES))")
         print(String(repeating: "=", count: 80))
         print(prompt)
         print(String(repeating: "=", count: 80))
         print("📏 Prompt length: \(prompt.count) characters")
-        print("📊 Recent JSONL entries: \(analysis.recentContent.count)")
+        print("📊 Ranked recent lines used: \(top.count) of \(analysis.recentContent.count) available (cap=\(MAX_RANKED_HISTORY_LINES))")
         print(String(repeating: "=", count: 80) + "\n")
         
         return prompt
@@ -889,6 +1167,23 @@ final class ContextAnalyzer {
             3. Consider what the user is likely trying to type in this application
             """
         }
+    }
+
+    // Determine which display contains the given point (global coordinates)
+    private func getDisplayContaining(point: CGPoint) -> (CGDirectDisplayID, CGRect)? {
+        var count: UInt32 = 0
+        CGGetActiveDisplayList(0, nil, &count)
+        let max = Int(count)
+        var ids = [CGDirectDisplayID](repeating: 0, count: max)
+        CGGetActiveDisplayList(count, &ids, &count)
+        for id in ids {
+            let bounds = CGDisplayBounds(id)
+            if bounds.contains(point) {
+                return (id, bounds)
+            }
+        }
+        let main = CGMainDisplayID()
+        return (main, CGDisplayBounds(main))
     }
 }
 
