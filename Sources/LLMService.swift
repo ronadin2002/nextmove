@@ -25,8 +25,23 @@ final class LLMService {
             self.apiKey = envKey
             print("🤖 OpenAI LLM service initialized with environment API key")
         } else {
-            self.apiKey = ""
-            print("⚠️ OPENAI_API_KEY not set. LLM calls will be skipped; using mock suggestions.")
+            // Try to load from .env in current working directory
+            let cwd = FileManager.default.currentDirectoryPath
+            let envPath = (cwd as NSString).appendingPathComponent(".env")
+            if let data = try? String(contentsOfFile: envPath),
+               let line = data.split(separator: "\n").first(where: { $0.trimmingCharacters(in: .whitespaces).hasPrefix("OPENAI_API_KEY=") }) {
+                let raw = line.replacingOccurrences(of: "OPENAI_API_KEY=", with: "")
+                let cleaned = raw.trimmingCharacters(in: CharacterSet(charactersIn: " \"'\n\r\t")).trimmingCharacters(in: .whitespacesAndNewlines)
+                self.apiKey = cleaned
+                if cleaned.isEmpty {
+                    print("⚠️ .env found but OPENAI_API_KEY is empty. LLM calls will be skipped; using mock suggestions.")
+                } else {
+                    print("🔑 OpenAI API key loaded from .env")
+                }
+            } else {
+                self.apiKey = ""
+                print("⚠️ OPENAI_API_KEY not set and no .env found. LLM calls will be skipped; using mock suggestions.")
+            }
         }
     }
     
@@ -206,11 +221,11 @@ final class LLMService {
                     "content": prompt
                 ]
             ],
-            "max_tokens": 300,  // Reduced to prevent rambling
-            "temperature": 0.3,  // Lower temperature for more focused responses
-            "top_p": 0.8,       // Reduced for better quality
-            "presence_penalty": 0.6,  // NEW: Discourage repetition
-            "frequency_penalty": 0.8  // NEW: Strong penalty for repeated content
+            "max_tokens": 300,
+            "temperature": 0.3,
+            "top_p": 0.8,
+            "presence_penalty": 0.6,
+            "frequency_penalty": 0.8
         ]
         
         var request = URLRequest(url: URL(string: baseURL)!)

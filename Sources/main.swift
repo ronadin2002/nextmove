@@ -3,6 +3,8 @@ import CoreGraphics
 import ScreenCaptureKit
 import Vision
 import QuartzCore
+import AppKit
+import ApplicationServices
 
 // MVP: Complete AI Writing Assistant with CMD+G → UI → Paste flow
 
@@ -28,6 +30,7 @@ class MainPipeline: NSObject, CaptureServiceDelegate, TextOutputDelegate, Hotkey
     let contextAnalyzer: ContextAnalyzer
     let llmService = LLMService()
     let pasteService = PasteService()
+    private var thinkingHUD: ThinkingHUD?
     
     var lastFrameTime: TimeInterval = 0
     private var statsTimer: Timer?
@@ -80,10 +83,34 @@ class MainPipeline: NSObject, CaptureServiceDelegate, TextOutputDelegate, Hotkey
     func captureService(_ service: CaptureService, didCapture frame: CapturedFrame) {
         ocrService.recognize(cgImage: frame.cgImage) { [weak self] ocrBlocks in
             guard let self = self else { return }
+            let appName = NSWorkspace.shared.frontmostApplication?.localizedName
+            let windowTitle: String? = {
+                let system = AXUIElementCreateSystemWide()
+                var focusedRef: CFTypeRef?
+                AXUIElementCopyAttributeValue(system, kAXFocusedWindowAttribute as CFString, &focusedRef)
+                var titleRef: CFTypeRef?
+                if let f = focusedRef {
+                    let focusedWindow: AXUIElement = unsafeBitCast(f, to: AXUIElement.self)
+                    AXUIElementCopyAttributeValue(focusedWindow, kAXTitleAttribute as CFString, &titleRef)
+                }
+                return titleRef as? String
+            }()
+            let urlString: String? = {
+                let system = AXUIElementCreateSystemWide()
+                var focusedElRef: CFTypeRef?
+                AXUIElementCopyAttributeValue(system, kAXFocusedUIElementAttribute as CFString, &focusedElRef)
+                var urlRef: CFTypeRef?
+                if let elRef = focusedElRef {
+                    let el: AXUIElement = unsafeBitCast(elRef, to: AXUIElement.self)
+                    AXUIElementCopyAttributeValue(el, "AXURL" as CFString, &urlRef)
+                }
+                return (urlRef as? URL)?.absoluteString
+            }()
             let textBlocks = normalize(blocks: ocrBlocks,
                                         in: CGSize(width: frame.cgImage.width, height: frame.cgImage.height),
-                                        app: nil,
-                                        title: nil)
+                                        app: appName,
+                                        title: windowTitle,
+                                        url: urlString)
             self.didExtractTextBlocks(textBlocks)
         }
     }
@@ -91,6 +118,10 @@ class MainPipeline: NSObject, CaptureServiceDelegate, TextOutputDelegate, Hotkey
     func didExtractTextBlocks(_ blocks: [TextBlock]) {
         let filtered = blocks.filter { $0.confidence > 0.6 }
         guard !filtered.isEmpty else { return }
+        // Skip logging if current foreground app is a terminal to avoid self-logging
+        let activeAppName = NSWorkspace.shared.frontmostApplication?.localizedName?.lowercased() ?? ""
+        let isTerminal = ["terminal", "iterm", "cursor"].contains { activeAppName.contains($0) }
+        if isTerminal { return }
         
         // Store to file but don't log to console
         let storageRef = self.storage
@@ -107,6 +138,10 @@ class MainPipeline: NSObject, CaptureServiceDelegate, TextOutputDelegate, Hotkey
     }
     
     private func handleCompleteAIFlow() async {
+        // Show tiny HUD near cursor immediately (ensure created on main actor)
+        let cursor = CGEvent(source: nil)?.location ?? .zero
+        let hud = await ensureHUD()
+        await hud.show(at: cursor)
         // Step 1: Analyze current context
         print("🔍 Step 1: Analyzing current context...")
         let analysis = await contextAnalyzer.analyzeCurrentContext()
@@ -120,10 +155,14 @@ class MainPipeline: NSObject, CaptureServiceDelegate, TextOutputDelegate, Hotkey
         
         // Step 3: Get AI suggestions
         print("💭 Step 3: Getting AI suggestions...")
+        let generationStartTime = Date()
         let suggestions = await llmService.getSuggestions(for: prompt)
+        let generationElapsed = Date().timeIntervalSince(generationStartTime)
+        print(String(format: "⏱️ Generation took %.2f s", generationElapsed))
         
         guard !suggestions.isEmpty else {
             print("❌ No suggestions received")
+            if let hud = thinkingHUD { await hud.hide() }
             return
         }
         
@@ -139,12 +178,14 @@ class MainPipeline: NSObject, CaptureServiceDelegate, TextOutputDelegate, Hotkey
         
         guard let selectedSuggestion = smartSuggestion else {
             print("❌ No suggestions available to paste")
+            if let hud = thinkingHUD { await hud.hide() }
             return
         }
         
-        print("\n🎯 Auto-pasting smart suggestion: [\(selectedSuggestion.type.uppercased())] \(String(selectedSuggestion.text.prefix(50)))...")
+        print("\n Auto-pasting smart suggestion: [\(selectedSuggestion.type.uppercased())] \(String(selectedSuggestion.text.prefix(50)))...")
 
         await handleAutoTextPasting(suggestion: selectedSuggestion)
+        if let hud = thinkingHUD { await hud.hide() }
     }
     
     private func handleAutoTextPasting(suggestion: LLMSuggestion) async {
@@ -178,6 +219,7 @@ class MainPipeline: NSObject, CaptureServiceDelegate, TextOutputDelegate, Hotkey
             rect: CGRect.zero,
             sourceApp: "AI_ASSISTANT",
             windowTitle: "Learning",
+            sourceURL: nil,
             ts: Date().timeIntervalSince1970,
             confidence: suggestion.confidence
         )
@@ -324,6 +366,16 @@ class MainPipeline: NSObject, CaptureServiceDelegate, TextOutputDelegate, Hotkey
         statsTimer?.invalidate()
         await self.storage.finalFlush()
         print("💾 Final flush completed")
+    }
+
+    // Ensure HUD is constructed on the main actor before first use
+    private func ensureHUD() async -> ThinkingHUD {
+        if let hud = thinkingHUD { return hud }
+        return await MainActor.run { [weak self] in
+            let hud = ThinkingHUD()
+            self?.thinkingHUD = hud
+            return hud
+        }
     }
 }
 
