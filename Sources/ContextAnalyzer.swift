@@ -88,7 +88,10 @@ final class ContextAnalyzer {
     private let axExtractor = AccessibilityTextExtractor()
     private let cursorInspector = CursorInspector()
     // High cap for how many ranked history lines go into the LLM prompt
-    private let MAX_RANKED_HISTORY_LINES = 3000
+    private let MAX_CONTEXT_HISTORY_LINES = 3000
+    // Adaptive limits to keep prompts fast and avoid timeouts
+    private let MAX_CONTEXT_LINES_HARD = 1500
+    private let MAX_CONTEXT_BUDGET_CHARS = 60000
     private var recentlyPastedContent: [String] = []  // NEW: Track recently pasted content
     private var lastPasteTime: TimeInterval = 0      // NEW: Track when we last pasted
     
@@ -399,7 +402,7 @@ final class ContextAnalyzer {
             print("📖 Found \(lines.count) total log entries in content.jsonl")
             
             // Take recent entries but filter out historical Wikipedia content
-            let maxRecentLines = 10000 // 10× more context requested by user
+            let maxRecentLines = MAX_CONTEXT_HISTORY_LINES
             let mostRecentLines = Array(lines.suffix(maxRecentLines))
             
             // CRITICAL: Filter out Virginia Regiment/Wikipedia historical content
@@ -424,33 +427,26 @@ final class ContextAnalyzer {
                 return true  // Keep current/relevant content
             }
             
-            print("📚 Filtered \(mostRecentLines.count) → \(filteredLines.count) entries (removed \(mostRecentLines.count - filteredLines.count) historical items). Sending 10× more logs as requested.")
-            
-            // Show file statistics
-            let fileSize = (try? FileManager.default.attributesOfItem(atPath: fileURL.path)[.size] as? Int64) ?? 0
-            print("📊 File stats: \(fileSize) bytes, \(lines.count) total entries, sending \(filteredLines.count) relevant to LLM")
-            
-            print("🔍 DEBUG: Last 15 FILTERED JSONL lines (NEWEST FIRST for LLM attention):")
-            for (i, line) in filteredLines.suffix(15).enumerated() {
-                print("   \(i+1). \(line)")
+            // Parse JSONL into plain text items (supports both new and legacy schemas)
+            var collected: [String] = []
+            for line in filteredLines {
+                guard let data = line.data(using: .utf8),
+                      let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
+                if let texts = obj["texts"] as? [String], !texts.isEmpty {
+                    collected.append(contentsOf: texts)
+                } else if let t = obj["t"] as? String, !t.isEmpty {
+                    collected.append(t)
+                }
             }
-            
-            // Calculate approximate prompt size
-            let totalChars = filteredLines.joined(separator: "\n").count
-            print("📏 Total context characters being sent: \(totalChars)")
-            
-            // CRITICAL: Return logs in REVERSE order so NEWEST logs appear at BOTTOM of LLM prompt
-            let reversedLines = Array(filteredLines.reversed())
-            print("✅ Logs will be presented to LLM with NEWEST at the bottom (most prominent position)")
-            
-            // Show order confirmation - first few (oldest) and last few (newest) entries
-            if reversedLines.count > 10 {
-                print("📋 LLM Context Order Preview:")
-                print("   OLDEST (top of context): \(reversedLines.prefix(3).map { String($0.prefix(50)) }.joined(separator: " | "))")
-                print("   NEWEST (bottom of context): \(reversedLines.suffix(3).map { String($0.prefix(50)) }.joined(separator: " | "))")
+            // De-dupe while preserving order
+            var seen = Set<String>()
+            let uniqueTexts = collected.filter { text in
+                if seen.contains(text) { return false }
+                seen.insert(text)
+                return true
             }
-            
-            return reversedLines
+            print("📚 Extracted \(uniqueTexts.count) unique text items from \(filteredLines.count) log lines")
+            return uniqueTexts
             
         } catch {
             print("❌ Error reading content logs: \(error)")
@@ -1061,8 +1057,42 @@ final class ContextAnalyzer {
         let ranked = analysis.recentContent
             .map { ($0, score(line: $0)) }
             .sorted { $0.1 == $1.1 ? $0.0.count > $1.0.count : $0.1 > $1.1 }
-        let top = ranked.prefix(MAX_RANKED_HISTORY_LINES).map { $0.0 }
-        let recentContext = top.joined(separator: "\n")
+        // Strict newest-to-oldest ordering: take from the end of the list backwards
+        var ordered = Array(analysis.recentContent.reversed())
+        if ordered.count > MAX_CONTEXT_HISTORY_LINES {
+            ordered = Array(ordered.prefix(MAX_CONTEXT_HISTORY_LINES))
+        }
+        // Start with the ordered list, then adaptively shrink by char budget and hard line cap
+        var top = ordered
+        // Enforce hard line cap first
+        if top.count > MAX_CONTEXT_LINES_HARD {
+            top = Array(top.prefix(MAX_CONTEXT_LINES_HARD))
+        }
+        // Enforce character budget on JSON serialization cost (rough heuristic)
+        var totalChars = 0
+        var budgeted: [String] = []
+        for item in top {
+            let added = item.count + 3 // quotes and comma overhead
+            if totalChars + added > MAX_CONTEXT_BUDGET_CHARS {
+                // Do not skip the first item even if it is long
+                if budgeted.isEmpty { budgeted.append(item) }
+                break
+            }
+            totalChars += added
+            budgeted.append(item)
+        }
+        top = budgeted
+        // Serialize context as JSON (matching content.jsonl schema) to embed in the prompt
+        let contextJSON: String = {
+            if let data = try? JSONSerialization.data(withJSONObject: [
+                "app": "AI_ASSISTANT",
+                "window": "CONTEXT",
+                "texts": top
+            ], options: []), let s = String(data: data, encoding: .utf8) {
+                return s
+            }
+            return "{\"app\":\"AI_ASSISTANT\",\"window\":\"CONTEXT\",\"texts\":[]}"
+        }()
         
         // STEP 1 — build the new prompt
         let prompt = """
@@ -1075,9 +1105,9 @@ final class ContextAnalyzer {
         TIMESTAMP  : \(analysis.timestamp)
         CURSOR LINE: \(analysis.currentScreen)
         
-        RELEVANT HISTORY (\(top.count) lines, newest → oldest)
+        RELEVANT HISTORY (JSON, newest → oldest)
         ────────────
-        \(recentContext)
+        \(contextJSON)
         
         COMPLETION RULES
         ────────────
@@ -1090,15 +1120,14 @@ final class ContextAnalyzer {
         { "text": "<completion>", "confidence": <0-1> }
         """
         
-        // Debug
+        // Debug — print only the full prompt (exactly what is sent)
         print("\n" + String(repeating: "=", count: 80))
-        print("🤖 PROMPT TO OPENAI (ranked up to \(MAX_RANKED_HISTORY_LINES))")
-        print(String(repeating: "=", count: 80))
         print(prompt)
         print(String(repeating: "=", count: 80))
-        print("📏 Prompt length: \(prompt.count) characters")
-        print("📊 Ranked recent lines used: \(top.count) of \(analysis.recentContent.count) available (cap=\(MAX_RANKED_HISTORY_LINES))")
-        print(String(repeating: "=", count: 80) + "\n")
+        print("\n")
+        // Log the full prompt as a single-line JSONL entry for later inspection
+        let storageRef = self.storage
+        Task.detached { await storageRef.logPrompt(app: "AI_ASSISTANT", window: "PROMPT", url: nil, prompt: prompt) }
         
         return prompt
     }

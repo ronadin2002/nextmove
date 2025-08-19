@@ -11,6 +11,8 @@ actor TextStorage {
     private var fileHandle: FileHandle?
     private let fileURL: URL
     private let startTime: Date = Date()
+    private var groupBuffer: [String: Set<String>] = [:] // key: app|window|url -> unique texts
+    private var alreadyLoggedPerGroup: [String: Set<String>] = [:] // normalized text keys seen per group across flushes
 
     // NEW: Semantic clustering for better compression
     struct SemanticCluster {
@@ -34,6 +36,9 @@ actor TextStorage {
         let category: ContentCategory
         let importance: ImportanceLevel  // NEW: Importance scoring
         let semanticSignature: String    // NEW: For semantic deduplication
+        let app: String?
+        let window: String?
+        let url: String?
         
         // NEW: Importance levels for intelligent filtering
         enum ImportanceLevel: String {
@@ -64,26 +69,8 @@ actor TextStorage {
             }
         }
         
-        func toCompactFormat(_ startTime: Date) -> [String: Any] {
-            let firstMinutes = Int((firstSeen - startTime.timeIntervalSince1970) / 60)
-            let lastMinutes = Int((lastSeen - startTime.timeIntervalSince1970) / 60)
-            
-            var entry: [String: Any] = [
-                "t": text,
-                "c": category.shortCode,
-                "i": importance.rawValue,  // NEW: Include importance
-                "v": viewCount
-            ]
-            
-            // Only add time fields if different or multiple views
-            if firstMinutes != lastMinutes || viewCount > 1 {
-                entry["f"] = firstMinutes
-                entry["l"] = lastMinutes
-            } else {
-                entry["m"] = firstMinutes
-            }
-            
-            return entry
+        func toGroupKey() -> String {
+            return "\(app ?? "Unknown")|\(window ?? "Unknown")|\(url ?? "")"
         }
     }
     
@@ -217,14 +204,7 @@ actor TextStorage {
     
     func ensureLogFileSetup() async {
         if !FileManager.default.fileExists(atPath: fileURL.path) {
-            let header = """
-# PasteRecall Content - Compact Format
-# t=text, c=category, v=views, m=minutes(single), f=first_min, l=last_min
-# Categories: e=email, u=url, c=code, d=doc, i=ui, n=num, t=text, f=file, o=other
-# Times are minutes since app start
-
-"""
-            try? header.write(to: fileURL, atomically: true, encoding: .utf8)
+            FileManager.default.createFile(atPath: fileURL.path, contents: nil)
         }
     }
 
@@ -258,12 +238,29 @@ actor TextStorage {
                     viewCount: 1,
                     category: category,
                     importance: importance,
-                    semanticSignature: semanticSignature
+                    semanticSignature: semanticSignature,
+                    app: block.sourceApp,
+                    window: block.windowTitle,
+                    url: block.sourceURL
                 )
                 contentMap[normalizedKey] = entry
                 pendingWrites.append(entry)
                 hasNewContent = true
             }
+        }
+        // Update group buffer for new entries
+        for entry in pendingWrites {
+            let key = entry.toGroupKey()
+            let normalized = normalizeForDeduplication(entry.text)
+            var seen = alreadyLoggedPerGroup[key] ?? Set<String>()
+            // Skip if we've already logged this normalized text for the group
+            if seen.contains(normalized) { continue }
+            seen.insert(normalized)
+            alreadyLoggedPerGroup[key] = seen
+            // Coalesce near-duplicates within this flush
+            var set = groupBuffer[key] ?? Set<String>()
+            insertCoalesced(entry.text, into: &set)
+            groupBuffer[key] = set
         }
         
         // Flush if needed
@@ -331,17 +328,28 @@ actor TextStorage {
     
     private func flushToDisk() async {
         guard !pendingWrites.isEmpty else { return }
-        
-        let linesToWrite = pendingWrites.compactMap { entry in
-            if let jsonData = try? JSONSerialization.data(withJSONObject: entry.toCompactFormat(startTime), options: []),
-               let jsonString = String(data: jsonData, encoding: .utf8) {
-                return jsonString + "\n"
+        // Build grouped JSONL lines per app/window/url with unique texts
+        var lines: [String] = []
+        for (key, textsSet) in groupBuffer {
+            let parts = key.split(separator: "|", omittingEmptySubsequences: false).map(String.init)
+            let app = parts.count > 0 ? parts[0] : "Unknown"
+            let window = parts.count > 1 ? parts[1] : "Unknown"
+            let url = parts.count > 2 && !parts[2].isEmpty ? parts[2] : nil
+            let texts = Array(textsSet)
+            var obj: [String: Any] = [
+                "app": app,
+                "window": window,
+                "texts": texts
+            ]
+            if let url = url { obj["url"] = url }
+            if let data = try? JSONSerialization.data(withJSONObject: obj, options: []),
+               let str = String(data: data, encoding: .utf8) {
+                lines.append(str + "\n")
             }
-            return nil
-        }.joined()
-        
+        }
+        let linesToWrite = lines.joined()
+        groupBuffer.removeAll()
         pendingWrites.removeAll()
-        
         // Write efficiently
         if #available(macOS 10.15.4, *) {
             do {
@@ -523,5 +531,56 @@ actor TextStorage {
         print("🔍 DEBUG: Returning \(recentEntries.count) items from storage")
         
         return Array(recentEntries)
+    }
+
+    // NEW: Log the full prompt as a single JSONL line in the same schema
+    func logPrompt(app: String = "AI_ASSISTANT", window: String = "PROMPT", url: String? = nil, prompt: String) async {
+        await ensureLogFileSetup()
+        var obj: [String: Any] = [
+            "app": app,
+            "window": window,
+            "texts": [prompt]
+        ]
+        if let url = url { obj["url"] = url }
+        guard let data = try? JSONSerialization.data(withJSONObject: obj, options: []),
+              let line = String(data: data, encoding: .utf8) else { return }
+        let toWrite = line + "\n"
+        if #available(macOS 10.15.4, *) {
+            do {
+                if fileHandle == nil {
+                    fileHandle = try FileHandle(forWritingTo: fileURL)
+                }
+                try fileHandle?.seekToEnd()
+                if let bytes = toWrite.data(using: .utf8) {
+                    try fileHandle?.write(contentsOf: bytes)
+                }
+            } catch {
+                await fallbackWrite(toWrite)
+            }
+        } else {
+            await fallbackWrite(toWrite)
+        }
+    }
+
+    // Insert text into a set, coalescing incremental substring variants
+    private func insertCoalesced(_ text: String, into set: inout Set<String>) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        // If an existing string already contains this (likely incremental typing), skip
+        for existing in set {
+            if existing.count >= trimmed.count,
+               existing.lowercased().contains(trimmed.lowercased()),
+               existing.count - trimmed.count <= 30 {
+                return
+            }
+        }
+        // If new is a longer version of an existing, replace the shorter one
+        let toRemove = set.filter { candidate in
+            trimmed.count >= candidate.count &&
+            trimmed.lowercased().contains(candidate.lowercased()) &&
+            trimmed.count - candidate.count <= 30
+        }
+        for r in toRemove { set.remove(r) }
+        set.insert(trimmed)
     }
 } 
