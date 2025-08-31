@@ -13,7 +13,7 @@ final class AccessibilityTextExtractor {
     func focusedTextWithCursor() -> FocusContext? {
         guard let frontmostApp = NSWorkspace.shared.frontmostApplication else { return nil }
         let appName = frontmostApp.localizedName ?? frontmostApp.bundleIdentifier ?? "Unknown"
-
+   
         let system = AXUIElementCreateSystemWide()
         guard let root = deepestFocusedElement(system: system) else { return nil }
         // Prefer an editable descendant if the focused element is a container
@@ -175,5 +175,69 @@ final class AccessibilityTextExtractor {
         let afterHead = String(after.prefix(200))
         if beforeTail.isEmpty && afterHead.isEmpty { return nil }
         return FocusContext(appName: appName, beforeCursor: beforeTail, afterCursor: afterHead)
+    }
+}
+
+// MARK: - Focused field metadata used by ContextAnalyzer
+extension AccessibilityTextExtractor {
+    struct FocusedFieldMeta {
+        let frame: CGRect?
+        let placeholder: String?
+        let label: String?
+        let role: String?
+    }
+
+    func focusedFieldMetadata() -> FocusedFieldMeta? {
+        let system = AXUIElementCreateSystemWide()
+        guard let root = deepestFocusedElement(system: system) else { return nil }
+        let element = findEditableDescendant(from: root) ?? root
+
+        // Role
+        var roleRef: CFTypeRef?
+        _ = AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &roleRef)
+        let role = roleRef as? String
+
+        // Placeholder (if supported)
+        var placeRef: CFTypeRef?
+        var placeholder: String? = nil
+        if AXUIElementCopyAttributeValue(element, kAXPlaceholderValueAttribute as CFString, &placeRef) == .success {
+            placeholder = placeRef as? String
+        }
+
+        // Frame
+        var frameRef: CFTypeRef?
+        var frame: CGRect? = nil
+        if AXUIElementCopyAttributeValue(element, "AXFrame" as CFString, &frameRef) == .success,
+           let fv = frameRef, CFGetTypeID(fv) == AXValueGetTypeID() {
+            let ax: AXValue = unsafeBitCast(fv, to: AXValue.self)
+            var r = CGRect.zero
+            if AXValueGetValue(ax, .cgRect, &r) { frame = r }
+        }
+
+        // Label via TitleUIElement or Title attribute fallbacks
+        var label: String? = nil
+        var titleElRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(element, kAXTitleUIElementAttribute as CFString, &titleElRef) == .success,
+           let tel = titleElRef, CFGetTypeID(tel) == AXUIElementGetTypeID() {
+            let titleEl: AXUIElement = unsafeBitCast(tel, to: AXUIElement.self)
+            var titleValRef: CFTypeRef?
+            if AXUIElementCopyAttributeValue(titleEl, kAXTitleAttribute as CFString, &titleValRef) == .success {
+                label = titleValRef as? String
+            }
+            if label == nil {
+                var valRef: CFTypeRef?
+                if AXUIElementCopyAttributeValue(titleEl, kAXValueAttribute as CFString, &valRef) == .success {
+                    label = valRef as? String
+                }
+            }
+        }
+        if label == nil {
+            var titleRef: CFTypeRef?
+            if AXUIElementCopyAttributeValue(element, kAXTitleAttribute as CFString, &titleRef) == .success {
+                label = titleRef as? String
+            }
+        }
+
+        return FocusedFieldMeta(frame: frame, placeholder: placeholder, label: label, role: role)
     }
 } 

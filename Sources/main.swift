@@ -138,8 +138,8 @@ class MainPipeline: NSObject, CaptureServiceDelegate, TextOutputDelegate, Hotkey
     }
     
     private func handleCompleteAIFlow() async {
-        // Show tiny HUD near cursor immediately (ensure created on main actor)
-        let cursor = CGEvent(source: nil)?.location ?? .zero
+        // Anchor HUD at the mouse cursor position at hotkey time (static during generation)
+        let cursor = NSEvent.mouseLocation
         let hud = await ensureHUD()
         await hud.show(at: cursor)
         // Step 1: Analyze current context
@@ -183,7 +183,7 @@ class MainPipeline: NSObject, CaptureServiceDelegate, TextOutputDelegate, Hotkey
         }
         
         print("\n Auto-pasting smart suggestion: [\(selectedSuggestion.type.uppercased())] \(String(selectedSuggestion.text.prefix(50)))...")
-
+        
         await handleAutoTextPasting(suggestion: selectedSuggestion)
         if let hud = thinkingHUD { await hud.hide() }
     }
