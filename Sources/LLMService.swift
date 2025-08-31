@@ -16,60 +16,39 @@ struct LLMResponse: Codable {
 @available(macOS 12.3, *)
 final class LLMService {
     private let apiKey: String
-    private let geminiApiKey: String?
     private let baseURL = "https://api.openai.com/v1/chat/completions"
-    private let geminiModel = "gemini-1.5-flash-latest"
-    private let geminiURLBase = "https://generativelanguage.googleapis.com/v1beta/models"
     private let session = URLSession.shared
-    private enum Provider { case openai, gemini }
-    private let provider: Provider
     
     init() {
         // For production, use environment variable: OPENAI_API_KEY
-        let env = ProcessInfo.processInfo.environment
-        let openaiKeyEnv = env["OPENAI_API_KEY"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let geminiKeyEnv = env["GEMINI_API_KEY"]?.trimmingCharacters(in: .whitespacesAndNewlines)
-        var openaiKey = openaiKeyEnv
-        var geminiKey: String? = geminiKeyEnv
-        // Try to load from .env in current working directory if missing
-        if (openaiKey.isEmpty || geminiKey == nil) {
+        if let envKey = ProcessInfo.processInfo.environment["OPENAI_API_KEY"], !envKey.isEmpty {
+            self.apiKey = envKey
+            print("🤖 OpenAI LLM service initialized with environment API key")
+        } else {
+            // Try to load from .env in current working directory
             let cwd = FileManager.default.currentDirectoryPath
             let envPath = (cwd as NSString).appendingPathComponent(".env")
-            if let data = try? String(contentsOfFile: envPath) {
-                if openaiKey.isEmpty, let line = data.split(separator: "\n").first(where: { $0.trimmingCharacters(in: .whitespaces).hasPrefix("OPENAI_API_KEY=") }) {
-                    let raw = line.replacingOccurrences(of: "OPENAI_API_KEY=", with: "")
-                    openaiKey = raw.trimmingCharacters(in: CharacterSet(charactersIn: " \"'\n\r\t")).trimmingCharacters(in: .whitespacesAndNewlines)
+            if let data = try? String(contentsOfFile: envPath),
+               let line = data.split(separator: "\n").first(where: { $0.trimmingCharacters(in: .whitespaces).hasPrefix("OPENAI_API_KEY=") }) {
+                let raw = line.replacingOccurrences(of: "OPENAI_API_KEY=", with: "")
+                let cleaned = raw.trimmingCharacters(in: CharacterSet(charactersIn: " \"'\n\r\t")).trimmingCharacters(in: .whitespacesAndNewlines)
+                self.apiKey = cleaned
+                if cleaned.isEmpty {
+                    print("⚠️ .env found but OPENAI_API_KEY is empty. LLM calls will be skipped; using mock suggestions.")
+                } else {
+                    print("🔑 OpenAI API key loaded from .env")
                 }
-                if geminiKey == nil, let gLine = data.split(separator: "\n").first(where: { $0.trimmingCharacters(in: .whitespaces).hasPrefix("GEMINI_API_KEY=") }) {
-                    let raw = gLine.replacingOccurrences(of: "GEMINI_API_KEY=", with: "")
-                    geminiKey = raw.trimmingCharacters(in: CharacterSet(charactersIn: " \"'\n\r\t")).trimmingCharacters(in: .whitespacesAndNewlines)
-                }
+            } else {
+                self.apiKey = ""
+                print("⚠️ OPENAI_API_KEY not set and no .env found. LLM calls will be skipped; using mock suggestions.")
             }
-        }
-        self.apiKey = openaiKey
-        self.geminiApiKey = (geminiKey?.isEmpty == true) ? nil : geminiKey
-        if let gKey = self.geminiApiKey, !gKey.isEmpty {
-            self.provider = .gemini
-            print("🤖 Gemini LLM service initialized (GEMINI_API_KEY detected)")
-        } else if !self.apiKey.isEmpty {
-            self.provider = .openai
-            print("🤖 OpenAI LLM service initialized with API key")
-        } else {
-            self.provider = .openai
-            print("⚠️ No LLM API key set (OPENAI_API_KEY or GEMINI_API_KEY). LLM calls will be skipped; using mock suggestions.")
         }
     }
     
     // Main function to get text suggestions from LLM
     func getSuggestions(for prompt: String) async -> [LLMSuggestion] {
         do {
-            let rawSuggestions: [LLMSuggestion]
-            switch provider {
-            case .gemini:
-                rawSuggestions = try await callGemini(prompt: prompt)
-            case .openai:
-                rawSuggestions = try await callOpenAI(prompt: prompt)
-            }
+            let rawSuggestions = try await callOpenAI(prompt: prompt)
             
             // NEW: Validate and filter suggestions to prevent hallucinations
             let validatedSuggestions = validateAndFilterSuggestions(rawSuggestions, originalPrompt: prompt)
@@ -254,7 +233,7 @@ final class LLMService {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.httpBody = try JSONSerialization.data(withJSONObject: requestBody)
-        request.timeoutInterval = 30.0
+        request.timeoutInterval = 10.0
         
         let (data, response) = try await session.data(for: request)
         
@@ -284,68 +263,6 @@ final class LLMService {
             throw LLMError.invalidJSON
         }
         
-        let llmResponse = try JSONDecoder().decode(LLMResponse.self, from: contentData)
-        if let suggestions = llmResponse.suggestions, !suggestions.isEmpty {
-            return suggestions
-        }
-        if let text = llmResponse.text, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            let conf = llmResponse.confidence ?? 0.7
-            return [LLMSuggestion(text: text, confidence: conf, type: "completion", source: "single")]
-        }
-        throw LLMError.invalidJSON
-    }
-
-    // Call Google Gemini API
-    private func callGemini(prompt: String) async throws -> [LLMSuggestion] {
-        guard let gKey = geminiApiKey, !gKey.isEmpty else {
-            throw LLMError.noAPIKey
-        }
-        // Combine system prompt + user prompt into one text for Gemini
-        let combined = "SYSTEM:\n\(buildEnhancedSystemPrompt())\n\nUSER:\n\(prompt)"
-        let body: [String: Any] = [
-            "contents": [
-                [
-                    "parts": [ [ "text": combined ] ]
-                ]
-            ],
-            "generationConfig": [
-                "temperature": 0.3,
-                "maxOutputTokens": 300,
-                "topP": 0.8
-            ]
-        ]
-        let urlStr = "\(geminiURLBase)/\(geminiModel):generateContent?key=\(gKey)"
-        guard let url = URL(string: urlStr) else { throw LLMError.invalidResponse }
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.httpBody = try JSONSerialization.data(withJSONObject: body)
-        req.timeoutInterval = 30.0
-        let (data, response) = try await session.data(for: req)
-        guard let httpResponse = response as? HTTPURLResponse else {
-            throw LLMError.invalidResponse
-        }
-        if httpResponse.statusCode != 200 {
-            let errorBody = String(data: data, encoding: .utf8) ?? "Unknown error"
-            print("❌ Gemini API error \(httpResponse.statusCode): \(errorBody)")
-            throw LLMError.apiError(httpResponse.statusCode, errorBody)
-        }
-        // Parse Gemini response → text
-        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let candidates = json["candidates"] as? [[String: Any]],
-              let first = candidates.first,
-              let content = first["content"] as? [String: Any],
-              let parts = content["parts"] as? [[String: Any]] else {
-            throw LLMError.invalidJSON
-        }
-        let combinedText = parts.compactMap { $0["text"] as? String }.joined(separator: "\n")
-        let cleanContent = combinedText
-            .replacingOccurrences(of: "```json", with: "")
-            .replacingOccurrences(of: "```", with: "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let contentData = cleanContent.data(using: .utf8) else {
-            throw LLMError.invalidJSON
-        }
         let llmResponse = try JSONDecoder().decode(LLMResponse.self, from: contentData)
         if let suggestions = llmResponse.suggestions, !suggestions.isEmpty {
             return suggestions

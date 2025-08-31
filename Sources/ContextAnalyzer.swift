@@ -53,6 +53,8 @@ struct LayoutAnalysis {
         let bounds: CGRect
         let placeholder: String?
         let label: String?
+        // NEW: Role info
+        let role: String?
     }
     
     struct UIElement {
@@ -141,9 +143,12 @@ final class ContextAnalyzer {
         var currentScreen: String = ""
 
         // Fast path: use Accessibility to get exact caret text if available
-        if let focused = AXFocused.string()?.trimmingCharacters(in: .whitespacesAndNewlines), !focused.isEmpty {
-            print("⚡️ AX captured focused text: \(focused.prefix(120))")
-            currentScreen = "TYPING: \(focused)____"
+		if let caret = axExtractor.focusedTextWithCursor() {
+			let before = caret.beforeCursor
+			let after = caret.afterCursor
+			let combined = before + "____" + after
+			print("⚡️ AX captured caret context: \(combined.prefix(120))")
+			currentScreen = "TYPING: \(combined)"
         }
 
         // If AX failed we fall back to OCR/cursor strategies
@@ -173,7 +178,23 @@ final class ContextAnalyzer {
         }
 
         // Build full analysis with layout etc.
-        let layoutAnalysis = await analyzeLayoutAndStructure(activeApp: activeApp)
+        var layoutAnalysis = await analyzeLayoutAndStructure(activeApp: activeApp)
+        // NEW: enrich focused element with AX field metadata
+        if let field = axExtractor.focusedFieldMetadata() {
+            let bounds = field.frame ?? .zero
+            let enriched = LayoutAnalysis.FocusedElement(
+                type: .textField,
+                bounds: bounds,
+                placeholder: field.placeholder,
+                label: field.label,
+                role: field.role
+            )
+            layoutAnalysis = LayoutAnalysis(
+                windowStructure: layoutAnalysis.windowStructure,
+                focusedElement: enriched,
+                nearbyElements: layoutAnalysis.nearbyElements
+            )
+        }
         let inputContext = await analyzeInputContext(screen: currentScreen, layout: layoutAnalysis)
         let semanticContext = await analyzeSemanticContext(input: inputContext, recent: await getRecentContent())
 
@@ -1094,6 +1115,15 @@ final class ContextAnalyzer {
             return "{\"app\":\"AI_ASSISTANT\",\"window\":\"CONTEXT\",\"texts\":[]}"
         }()
         
+        // Compose focused field line if present
+        let focusedFieldLine: String = {
+            if let f = analysis.layoutAnalysis.focusedElement {
+                let name = f.label ?? f.placeholder ?? f.role ?? ""
+                if !name.isEmpty { return "FOCUSED FIELD: \(name)" }
+            }
+            return ""
+        }()
+        
         // STEP 1 — build the new prompt
         let prompt = """
         SYSTEM:
@@ -1104,6 +1134,7 @@ final class ContextAnalyzer {
         APP        : \(analysis.activeApp)
         TIMESTAMP  : \(analysis.timestamp)
         CURSOR LINE: \(analysis.currentScreen)
+        \(focusedFieldLine)
         
         RELEVANT HISTORY (JSON, newest → oldest)
         ────────────
@@ -1120,14 +1151,14 @@ final class ContextAnalyzer {
         { "text": "<completion>", "confidence": <0-1> }
         """
         
-        // Debug — print only the full prompt (exactly what is sent)
-        print("\n" + String(repeating: "=", count: 80))
-        print(prompt)
-        print(String(repeating: "=", count: 80))
-        print("\n")
-        // Log the full prompt as a single-line JSONL entry for later inspection
+        // Log prompt to file asynchronously (single JSONL entry)
         let storageRef = self.storage
-        Task.detached { await storageRef.logPrompt(app: "AI_ASSISTANT", window: "PROMPT", url: nil, prompt: prompt) }
+        		Task.detached {
+			await storageRef.logPrompt(prompt: prompt)
+		}
+        
+        // Also print exact string being sent to LLM
+        print("\n===== FULL PROMPT SENT TO LLM =====\n\(prompt)\n===== END PROMPT =====\n")
         
         return prompt
     }
