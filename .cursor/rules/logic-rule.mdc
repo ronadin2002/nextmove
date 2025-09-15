@@ -1,0 +1,7 @@
+---
+description:
+globs:
+alwaysApply: true
+---
+
+1. Remember - a cursor is not a caret. If the user asks to do something related to carets, then don't switch to thinking they were talking about the cursors
