@@ -130,6 +130,15 @@ final class ContextAnalyzer {
         print("⏳ Waiting for you to return to your document window...")
         try? await Task.sleep(nanoseconds: 1_000_000_000) // 1 second wait
         
+        // Take screenshot with caret annotation
+        print("📸 Taking screenshot with caret annotation...")
+        let screenshotSuccess = axExtractor.captureScreenWithCaretAnnotation()
+        if screenshotSuccess {
+            print("✅ Screenshot saved successfully")
+        } else {
+            print("❌ Failed to capture screenshot")
+        }
+        
         // Get current active application AFTER the wait
         let activeApp = getCurrentActiveApp()
         print("🎯 Detected active app: \(activeApp)")

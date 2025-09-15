@@ -1,6 +1,9 @@
 import Foundation
 import AppKit
 import ApplicationServices
+import CoreGraphics
+import QuartzCore
+import UniformTypeIdentifiers
 
 @available(macOS 12.3, *)
 final class AccessibilityTextExtractor {
@@ -306,5 +309,191 @@ extension AccessibilityTextExtractor {
         let afterWords = firstWords(after, maxWordsAfter)
         if beforeWords.isEmpty && afterWords.isEmpty { return nil }
         return (beforeWords, afterWords)
+    }
+    
+    /// Takes a screenshot of the whole screen and annotates it with an arrow pointing to the caret
+    func captureScreenWithCaretAnnotation() -> Bool {
+        let system = AXUIElementCreateSystemWide()
+        guard let root = deepestFocusedElement(system: system) else { return false }
+        let element = findEditableDescendant(from: root) ?? root
+        
+        // Get the caret position on screen
+        guard let caretRect = getCaretScreenPosition(element: element) else { return false }
+        
+        // Take screenshot of the entire screen
+        guard let screenshot = captureFullScreen() else { return false }
+        
+        // Annotate with arrow pointing to caret
+        let annotatedImage = addCaretArrow(to: screenshot, caretPosition: caretRect)
+        
+        // Save the image
+        return saveAnnotatedImage(annotatedImage)
+    }
+    
+    private func getCaretScreenPosition(element: AXUIElement) -> CGRect? {
+        print("🎯 Attempting to detect caret position using BoundsForRange...")
+        
+        // Only use the most accurate method: bounds for range
+        if let rect = getCaretUsingBoundsForRange(element: element) {
+            print("✅ Caret found using BoundsForRange: \(rect)")
+            return rect
+        }
+        
+        print("❌ Failed to determine caret position - BoundsForRange not supported")
+        return nil
+    }
+    
+    private func getCaretUsingBoundsForRange(element: AXUIElement) -> CGRect? {
+        var selRangeRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &selRangeRef) == .success,
+              let rr = selRangeRef, CFGetTypeID(rr) == AXValueGetTypeID() else { 
+            print("❌ BoundsForRange: Failed to get selection range")
+            return nil 
+        }
+        let axRange: AXValue = unsafeBitCast(rr, to: AXValue.self)
+        guard AXValueGetType(axRange) == .cfRange else { 
+            print("❌ BoundsForRange: Invalid range type")
+            return nil 
+        }
+        var sel = CFRange(location: 0, length: 0)
+        guard AXValueGetValue(axRange, .cfRange, &sel) else { 
+            print("❌ BoundsForRange: Failed to extract range value")
+            return nil 
+        }
+        
+        print("📍 Selection range: location=\(sel.location), length=\(sel.length)")
+        
+        var boundsRef: CFTypeRef?
+        var range = sel
+        guard let param: AXValue = AXValueCreate(.cfRange, &range) else { return nil }
+        
+        if AXUIElementCopyParameterizedAttributeValue(element, kAXBoundsForRangeParameterizedAttribute as CFString, param, &boundsRef) == .success,
+           let bounds = boundsRef, CFGetTypeID(bounds) == AXValueGetTypeID() {
+            let axBounds: AXValue = unsafeBitCast(bounds, to: AXValue.self)
+            var rect = CGRect.zero
+            if AXValueGetValue(axBounds, .cgRect, &rect) {
+                print("📍 BoundsForRange result: \(rect)")
+                return rect
+            }
+        }
+        print("❌ BoundsForRange: Failed to get bounds")
+        return nil
+    }
+    
+    
+    private func captureFullScreen() -> CGImage? {
+        let displayID = CGMainDisplayID()
+        return CGDisplayCreateImage(displayID)
+    }
+    
+    private func addCaretArrow(to image: CGImage, caretPosition: CGRect) -> CGImage? {
+        let width = image.width
+        let height = image.height
+        
+        guard let context = CGContext(data: nil,
+                                    width: width,
+                                    height: height,
+                                    bitsPerComponent: 8,
+                                    bytesPerRow: 0,
+                                    space: CGColorSpaceCreateDeviceRGB(),
+                                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
+            return nil
+        }
+        
+        // Draw the original image
+        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+        
+        // Convert caret position to image coordinates (flip Y axis)
+        let caretX = caretPosition.midX
+        let caretY = CGFloat(height) - caretPosition.midY
+        
+        // Draw arrow pointing to caret
+        drawArrow(in: context, pointingTo: CGPoint(x: caretX, y: caretY))
+        
+        return context.makeImage()
+    }
+    
+    private func drawArrow(in context: CGContext, pointingTo point: CGPoint) {
+        context.saveGState()
+        
+        // Set arrow properties
+        context.setStrokeColor(red: 1.0, green: 0.0, blue: 0.0, alpha: 1.0) // Red color
+        context.setFillColor(red: 1.0, green: 0.0, blue: 0.0, alpha: 1.0)
+        context.setLineWidth(3.0)
+        
+        // Arrow dimensions
+        let arrowHeadSize: CGFloat = 15
+        
+        // Position arrow above and to the left of the caret
+        let arrowStart = CGPoint(x: point.x - 40, y: point.y - 40)
+        let arrowEnd = point
+        
+        // Draw arrow line
+        context.move(to: arrowStart)
+        context.addLine(to: arrowEnd)
+        context.strokePath()
+        
+        // Calculate arrow head
+        let angle = atan2(arrowEnd.y - arrowStart.y, arrowEnd.x - arrowStart.x)
+        let arrowHead1 = CGPoint(
+            x: arrowEnd.x - arrowHeadSize * cos(angle - .pi/6),
+            y: arrowEnd.y - arrowHeadSize * sin(angle - .pi/6)
+        )
+        let arrowHead2 = CGPoint(
+            x: arrowEnd.x - arrowHeadSize * cos(angle + .pi/6),
+            y: arrowEnd.y - arrowHeadSize * sin(angle + .pi/6)
+        )
+        
+        // Draw arrow head
+        context.move(to: arrowEnd)
+        context.addLine(to: arrowHead1)
+        context.move(to: arrowEnd)
+        context.addLine(to: arrowHead2)
+        context.strokePath()
+        
+        // Add a small circle at the caret position for better visibility
+        context.setFillColor(red: 1.0, green: 0.0, blue: 0.0, alpha: 0.8)
+        context.fillEllipse(in: CGRect(x: point.x - 5, y: point.y - 5, width: 10, height: 10))
+        
+        context.restoreGState()
+    }
+    
+    private func saveAnnotatedImage(_ image: CGImage?) -> Bool {
+        guard let image = image else { return false }
+        
+        // Create screenshots directory if it doesn't exist
+        let screenshotsDir = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent("screenshots")
+        
+        do {
+            try FileManager.default.createDirectory(at: screenshotsDir, withIntermediateDirectories: true)
+        } catch {
+            print("Failed to create screenshots directory: \(error)")
+            return false
+        }
+        
+        // Generate filename with timestamp
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
+        let timestamp = formatter.string(from: Date())
+        let filename = "caret_screenshot_\(timestamp).png"
+        let fileURL = screenshotsDir.appendingPathComponent(filename)
+        
+        // Save the image
+        guard let destination = CGImageDestinationCreateWithURL(fileURL as CFURL, UTType.png.identifier as CFString, 1, nil) else {
+            print("Failed to create image destination")
+            return false
+        }
+        
+        CGImageDestinationAddImage(destination, image, nil)
+        let success = CGImageDestinationFinalize(destination)
+        
+        if success {
+            print("📸 Screenshot saved to: \(fileURL.path)")
+        } else {
+            print("❌ Failed to save screenshot")
+        }
+        
+        return success
     }
 } 

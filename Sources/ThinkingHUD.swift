@@ -3,7 +3,7 @@ import AppKit
 import QuartzCore
 import CoreImage
 import SwiftUI
-import Orb
+// import Orb
 
 @available(macOS 12.3, *)
 @MainActor
@@ -29,31 +29,21 @@ final class ThinkingHUD: NSObject {
 		win.titleVisibility = .hidden
 		win.titlebarAppearsTransparent = true
 		
-		// Orb-only content view
-		let orbSize: CGFloat = 28
+		// Simple spinning indicator content view
+		let indicatorSize: CGFloat = 28
 		let container = NSView(frame: NSRect(origin: .zero, size: frame.size))
 		container.wantsLayer = true
 		win.contentView = container
 		
-		let config = OrbConfiguration(
-			backgroundColors: [
-				Color(red: 0.05, green: 0.30, blue: 0.85),
-				Color(red: 0.00, green: 0.20, blue: 0.55)
-			],
-			glowColor: Color(red: 0.20, green: 0.45, blue: 1.00),
-			coreGlowIntensity: 1.25,
-			showBackground: true,
-			showWavyBlobs: true,
-			showParticles: false,
-			showGlowEffects: true,
-			showShadow: false,
-			speed: 60
-		)
-		let orbView = OrbView(configuration: config)
-			.frame(width: orbSize, height: orbSize)
+		// Create a simple spinning indicator using SwiftUI
+		let spinningIndicator = ProgressView()
+			.progressViewStyle(CircularProgressViewStyle(tint: Color.blue))
+			.scaleEffect(1.5)
+			.frame(width: indicatorSize, height: indicatorSize)
 			.allowsHitTesting(false)
-		let host = NSHostingView(rootView: orbView)
-		host.frame = CGRect(x: (frame.width - orbSize)/2, y: (frame.height - orbSize)/2, width: orbSize, height: orbSize)
+		
+		let host = NSHostingView(rootView: spinningIndicator)
+		host.frame = CGRect(x: (frame.width - indicatorSize)/2, y: (frame.height - indicatorSize)/2, width: indicatorSize, height: indicatorSize)
 		container.addSubview(host)
 		
 		win.alphaValue = 0
