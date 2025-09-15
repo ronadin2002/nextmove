@@ -23,7 +23,7 @@ final class AccessibilityTextExtractor {
         if let ctx = extractUsingSelectionAPIs(element: element, appName: appName) {
             return ctx
         }
-
+ 
         // Fallback to value + range if available
         var valueRef: CFTypeRef?
         _ = AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &valueRef)
@@ -239,5 +239,72 @@ extension AccessibilityTextExtractor {
         }
 
         return FocusedFieldMeta(frame: frame, placeholder: placeholder, label: label, role: role)
+    }
+} 
+
+// MARK: - Typing snippet (few words before/after caret)
+extension AccessibilityTextExtractor {
+    /// Returns small before/after snippets (by words) around the caret using AX selection APIs
+    /// Falls back to using kAXValue when stringForRange is unavailable
+    func typingSnippet(maxWordsBefore: Int = 6, maxWordsAfter: Int = 6) -> (before: String, after: String)? {
+        let system = AXUIElementCreateSystemWide()
+        guard let root = deepestFocusedElement(system: system) else { return nil }
+        let element = findEditableDescendant(from: root) ?? root
+
+        // Get caret/selection range
+        var selRangeRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &selRangeRef) == .success,
+              let rr = selRangeRef, CFGetTypeID(rr) == AXValueGetTypeID() else { return nil }
+        let axRange: AXValue = unsafeBitCast(rr, to: AXValue.self)
+        guard AXValueGetType(axRange) == .cfRange else { return nil }
+        var sel = CFRange(location: 0, length: 0)
+        guard AXValueGetValue(axRange, .cfRange, &sel) else { return nil }
+        let caretIndex = sel.location
+
+        // Prefer parameterized stringForRange
+        func stringFor(_ range: CFRange) -> String {
+            var out: CFTypeRef?
+            var r = range
+            guard let param: AXValue = AXValueCreate(.cfRange, &r) else { return "" }
+            let ok = AXUIElementCopyParameterizedAttributeValue(element, kAXStringForRangeParameterizedAttribute as CFString, param, &out)
+            if ok == .success, let s = out as? String { return s }
+            return ""
+        }
+
+        // Try to fetch small windows around caret using stringForRange
+        let windowLen = 200
+        let beforeRange = CFRange(location: max(0, caretIndex - windowLen), length: min(windowLen, caretIndex))
+        let afterRange = CFRange(location: caretIndex, length: windowLen)
+        var before = stringFor(beforeRange)
+        var after = stringFor(afterRange)
+
+        if before.isEmpty && after.isEmpty {
+            // Fallback to kAXValue
+            var valRef: CFTypeRef?
+            _ = AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &valRef)
+            let fullText = (valRef as? String) ?? ""
+            let ns = fullText as NSString
+            let start = min(max(0, caretIndex), ns.length)
+            let pre = ns.substring(with: NSRange(location: max(0, start - windowLen), length: min(windowLen, start)))
+            let post = ns.substring(from: start)
+            before = pre
+            after = String(post.prefix(windowLen))
+        }
+
+        func lastWords(_ s: String, _ n: Int) -> String {
+            let parts = s.split(whereSeparator: { $0.isWhitespace || $0.isNewline })
+            guard !parts.isEmpty else { return "" }
+            return parts.suffix(n).joined(separator: " ")
+        }
+        func firstWords(_ s: String, _ n: Int) -> String {
+            let parts = s.split(whereSeparator: { $0.isWhitespace || $0.isNewline })
+            guard !parts.isEmpty else { return "" }
+            return parts.prefix(n).joined(separator: " ")
+        }
+
+        let beforeWords = lastWords(before, maxWordsBefore)
+        let afterWords = firstWords(after, maxWordsAfter)
+        if beforeWords.isEmpty && afterWords.isEmpty { return nil }
+        return (beforeWords, afterWords)
     }
 } 

@@ -72,8 +72,8 @@ class MainPipeline: NSObject, CaptureServiceDelegate, TextOutputDelegate, Hotkey
         do {
             try await captureService.start()
             print("📝 Logging content to ./content.jsonl")
-            print("🔥 CMD+J hotkey ready for smart completion assistance!")
-            print("✨ Demo flow: CMD+J → Context Analysis → LLM → Auto-Complete Data")
+            print("🔥 CTRL+G hotkey ready for smart completion assistance!")
+            print("✨ Demo flow: CTRL+G → Context Analysis → LLM → Auto-Complete Data")
         } catch {
             print("Failed to start capture: \(error)")
             exit(1)
@@ -131,7 +131,7 @@ class MainPipeline: NSObject, CaptureServiceDelegate, TextOutputDelegate, Hotkey
     // MARK: - AI Writing Assistant (Complete Demo Flow)
     
     func hotkeyTriggered() {
-        print("\n🚀 CMD+J pressed! Starting smart completion assistance...")
+        print("\n🚀 CTRL+G pressed! Starting smart completion assistance...")
         Task {
             await handleCompleteAIFlow()
         }

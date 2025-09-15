@@ -93,7 +93,7 @@ final class ContextAnalyzer {
     private let MAX_CONTEXT_HISTORY_LINES = 3000
     // Adaptive limits to keep prompts fast and avoid timeouts
     private let MAX_CONTEXT_LINES_HARD = 1500
-    private let MAX_CONTEXT_BUDGET_CHARS = 60000
+    private let MAX_CONTEXT_BUDGET_CHARS = 10000
     private var recentlyPastedContent: [String] = []  // NEW: Track recently pasted content
     private var lastPasteTime: TimeInterval = 0      // NEW: Track when we last pasted
     
@@ -122,7 +122,7 @@ final class ContextAnalyzer {
         }
     }
     
-    // Main function to analyze current context when CMD+J is pressed
+    // Main function to analyze current context when CTRL+G is pressed
     func analyzeCurrentContext() async -> ContextAnalysis {
         print("🔍 Analyzing current context...")
         
@@ -140,43 +140,16 @@ final class ContextAnalyzer {
             try? await Task.sleep(nanoseconds: 2_000_000_000) // 2 more seconds
         }
         
-        var currentScreen: String = ""
-
-        // Fast path: use Accessibility to get exact caret text if available
-		if let caret = axExtractor.focusedTextWithCursor() {
-			let before = caret.beforeCursor
-			let after = caret.afterCursor
-			let combined = before + "____" + after
-			print("⚡️ AX captured caret context: \(combined.prefix(120))")
-			currentScreen = "TYPING: \(combined)"
-        }
-
-        // If AX failed we fall back to OCR/cursor strategies
-        var mouseLocation = CGEvent(source: nil)?.location ?? .zero
-        
-        // If we already have currentScreen from AX, build analysis directly later
-        if currentScreen.isEmpty {
-            // Get main display info
-            guard let displayID = CGMainDisplayID() as CGDirectDisplayID?,
-                  let displayBounds = CGDisplayBounds(displayID) as CGRect? else {
-                currentScreen = ""
-                // Proceed but layout may be empty
-                mouseLocation = .zero
+        // OCR-based typing context (no AX dependency)
+        let currentScreen: String = {
+            if let snip = axExtractor.typingSnippet(maxWordsBefore: 6, maxWordsAfter: 6) {
+                let combined = snip.before + "____" + snip.after
+                print("⚡️ AX snippet caret context: \(combined.prefix(120))")
+                return "TYPING: \(combined)"
             }
-            
-            print("🎯 Smart capture strategy at cursor: (\(Int(mouseLocation.x)), \(Int(mouseLocation.y)))")
-            
-            // Strategy 1: Capture focused area around cursor (for immediate context)
-            let focusedText = await captureFocusedArea(mouseLocation: mouseLocation, displayID: displayID, displayBounds: displayBounds)
-            
-            // Strategy 2: Capture broader context (for layout understanding)
-            let contextText = await captureBroaderContext(mouseLocation: mouseLocation, displayID: displayID, displayBounds: displayBounds)
-            
-            // Combine and analyze what user is likely typing/completing
-            currentScreen = analyzeCapturedContext(focused: focusedText, broader: contextText)
-            print("🔍 Smart capture result: '\(currentScreen.isEmpty ? "No relevant text" : String(currentScreen.prefix(150)))...'")
-        }
-
+            return "TYPING: ____"
+        }()
+        
         // Build full analysis with layout etc.
         var layoutAnalysis = await analyzeLayoutAndStructure(activeApp: activeApp)
         // NEW: enrich focused element with AX field metadata
@@ -197,9 +170,9 @@ final class ContextAnalyzer {
         }
         let inputContext = await analyzeInputContext(screen: currentScreen, layout: layoutAnalysis)
         let semanticContext = await analyzeSemanticContext(input: inputContext, recent: await getRecentContent())
-
+        
         let cursorPosition = getCursorPosition()
-
+        
         let analysis = ContextAnalysis(
             currentScreen: currentScreen,
             recentContent: semanticContext.relevantHistorySnippets,
@@ -211,11 +184,120 @@ final class ContextAnalyzer {
             layoutAnalysis: layoutAnalysis,
             semanticContext: semanticContext
         )
-
+        
         // Debug
         print("📊 Enhanced analysis complete: App=\(activeApp) CurrentText='\(inputContext.currentText.prefix(50))' Confidence=\(analysis.confidence)")
-
+        
         return analysis
+    }
+
+    // Build TYPING: line from OCR under the mouse; split at mouse X
+    private func buildTypingFromOCR() async -> String {
+		guard let winFrame = getFocusedWindowFrame() else { return "TYPING: ____" }
+		// Define ROI inside the window to reduce cost
+		let inset: CGFloat = 40
+		let roi = winFrame.insetBy(dx: inset, dy: inset)
+		guard let (displayID, _) = getDisplayContaining(point: roi.origin) else { return "TYPING: ____" }
+		// Capture two frames to detect the blinking caret column
+		guard let img1 = CGDisplayCreateImage(displayID, rect: roi) else { return "TYPING: ____" }
+		try? await Task.sleep(nanoseconds: 200_000_000) // 200 ms
+		guard let img2 = CGDisplayCreateImage(displayID, rect: roi) else { return "TYPING: ____" }
+		guard let caretLocalX = detectBlinkingCaretX(img1: img1, img2: img2) else { return "TYPING: ____" }
+		let blocks = await recognizeBlocks(img2)
+		guard !blocks.isEmpty else { return "TYPING: ____" }
+		// Map OCR boxes to ROI space
+		let sizedBlocks: [(OcrBlock, CGRect)] = blocks.map { blk in
+			let r = CGRect(x: blk.boundingBox.minX * CGFloat(img2.width),
+						  y: blk.boundingBox.minY * CGFloat(img2.height),
+						  width: blk.boundingBox.width * CGFloat(img2.width),
+						  height: blk.boundingBox.height * CGFloat(img2.height))
+			return (blk, r)
+		}
+		// Choose block whose rect horizontally spans caret x, with minimal vertical distance to its center
+		let target = sizedBlocks.min(by: { a, b in
+			let aDistX = a.1.minX <= caretLocalX && caretLocalX <= a.1.maxX ? 0.0 : min(abs(caretLocalX - a.1.minX), abs(caretLocalX - a.1.maxX))
+			let bDistX = b.1.minX <= caretLocalX && caretLocalX <= b.1.maxX ? 0.0 : min(abs(caretLocalX - b.1.minX), abs(caretLocalX - b.1.maxX))
+			if aDistX == bDistX {
+				let aVD = abs((a.1.midY) - CGFloat(img2.height)/2)
+				let bVD = abs((b.1.midY) - CGFloat(img2.height)/2)
+				return aVD < bVD
+			}
+			return aDistX < bDistX
+		})
+		guard let (best, bestRect) = target else { return "TYPING: ____" }
+		let relX = max(0, min(1, (caretLocalX - bestRect.minX) / max(bestRect.width, 1)))
+		let chars = Array(best.text)
+		let idx = Int(round(relX * CGFloat(max(chars.count, 1))))
+		let before = String(chars.prefix(idx))
+		let after = String(chars.suffix(chars.count - idx))
+		let combined = before + "____" + after
+		print("✏️ OCR caret typing: '" + combined.prefix(120) + "'")
+		return "TYPING: \(combined)"
+	}
+
+	private func getFocusedWindowFrame() -> CGRect? {
+		let system = AXUIElementCreateSystemWide()
+		var winRef: CFTypeRef?
+		guard AXUIElementCopyAttributeValue(system, kAXFocusedWindowAttribute as CFString, &winRef) == .success,
+			  let w = winRef, CFGetTypeID(w) == AXUIElementGetTypeID() else { return nil }
+		let windowAX: AXUIElement = unsafeBitCast(w, to: AXUIElement.self)
+		var frameRef: CFTypeRef?
+		guard AXUIElementCopyAttributeValue(windowAX, "AXFrame" as CFString, &frameRef) == .success,
+			  let fr = frameRef, CFGetTypeID(fr) == AXValueGetTypeID() else { return nil }
+		let axVal: AXValue = unsafeBitCast(fr, to: AXValue.self)
+		var rect = CGRect.zero
+		guard AXValueGetValue(axVal, .cgRect, &rect) else { return nil }
+		return rect
+	}
+
+	private func detectBlinkingCaretX(img1: CGImage, img2: CGImage) -> CGFloat? {
+		guard img1.width == img2.width, img1.height == img2.height else { return nil }
+		let w = img2.width, h = img2.height
+		guard let d1 = copyRGBAData(from: img1), let d2 = copyRGBAData(from: img2) else { return nil }
+		var columnDiff = [Int](repeating: 0, count: w)
+		let stride = 4
+		for y in 0..<h {
+			let row1 = y * w * stride
+			let row2 = y * w * stride
+			for x in 0..<w {
+				let i1 = row1 + x*stride
+				let i2 = row2 + x*stride
+				let r1 = Int(d1[i1]), g1 = Int(d1[i1+1]), b1 = Int(d1[i1+2])
+				let r2 = Int(d2[i2]), g2 = Int(d2[i2+1]), b2 = Int(d2[i2+2])
+				let l1 = (299*r1 + 587*g1 + 114*b1) / 1000
+				let l2 = (299*r2 + 587*g2 + 114*b2) / 1000
+				columnDiff[x] += abs(l1 - l2)
+			}
+		}
+		// Find column with max change
+		guard let maxPair = columnDiff.enumerated().max(by: { $0.element < $1.element }), maxPair.element > 0 else { return nil }
+		return CGFloat(maxPair.offset)
+	}
+
+	private func copyRGBAData(from image: CGImage) -> [UInt8]? {
+		let w = image.width, h = image.height
+		let bytesPerPixel = 4
+		let bytesPerRow = bytesPerPixel * w
+		var data = [UInt8](repeating: 0, count: Int(bytesPerRow * h))
+		guard let ctx = CGContext(data: &data,
+								   width: w,
+								   height: h,
+								   bitsPerComponent: 8,
+								   bytesPerRow: bytesPerRow,
+								   space: CGColorSpaceCreateDeviceRGB(),
+								   bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+		ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+		return data
+	}
+
+    private func recognizeBlocks(_ cgImage: CGImage) async -> [OcrBlock] {
+        return await withCheckedContinuation { cont in
+            let o = OcrService()
+            o.recognize(cgImage: cgImage) { blocks in
+                let filtered = blocks.filter { $0.confidence > 0.6 && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+                cont.resume(returning: filtered)
+            }
+        }
     }
     
     // NEW: Analyze layout and UI structure
@@ -1083,26 +1165,18 @@ final class ContextAnalyzer {
         if ordered.count > MAX_CONTEXT_HISTORY_LINES {
             ordered = Array(ordered.prefix(MAX_CONTEXT_HISTORY_LINES))
         }
-        // Start with the ordered list, then adaptively shrink by char budget and hard line cap
-        var top = ordered
-        // Enforce hard line cap first
-        if top.count > MAX_CONTEXT_LINES_HARD {
-            top = Array(top.prefix(MAX_CONTEXT_LINES_HARD))
-        }
-        // Enforce character budget on JSON serialization cost (rough heuristic)
-        var totalChars = 0
-        var budgeted: [String] = []
-        for item in top {
-            let added = item.count + 3 // quotes and comma overhead
-            if totalChars + added > MAX_CONTEXT_BUDGET_CHARS {
-                // Do not skip the first item even if it is long
-                if budgeted.isEmpty { budgeted.append(item) }
+        // Strict trailing 10,000-char window: take newest items until budget fills
+        var top: [String] = []
+        var used = 0
+        for item in ordered {
+            let added = item.count + 3 // quotes + comma overhead
+            if used + added > MAX_CONTEXT_BUDGET_CHARS {
+                if top.isEmpty { top = [item] } // ensure at least the newest chunk
                 break
             }
-            totalChars += added
-            budgeted.append(item)
+            used += added
+            top.append(item)
         }
-        top = budgeted
         // Serialize context as JSON (matching content.jsonl schema) to embed in the prompt
         let contextJSON: String = {
             if let data = try? JSONSerialization.data(withJSONObject: [
@@ -1142,6 +1216,7 @@ final class ContextAnalyzer {
         
         COMPLETION RULES
         ────────────
+        1. Output ONLY the minimal missing continuation after ____; do NOT repeat any text already present before ____.
         1. Replace the ____ marker with ≤ 25 tokens that complete the cursor line grammatically.
         2. Re-use phrases / data from RELEVANT HISTORY when helpful.
         3. Do NOT inject new topics; stay on the same subject & tone.

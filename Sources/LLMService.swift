@@ -49,12 +49,8 @@ final class LLMService {
     func getSuggestions(for prompt: String) async -> [LLMSuggestion] {
         do {
             let rawSuggestions = try await callOpenAI(prompt: prompt)
-            
-            // NEW: Validate and filter suggestions to prevent hallucinations
-            let validatedSuggestions = validateAndFilterSuggestions(rawSuggestions, originalPrompt: prompt)
-            
-            print("✅ LLM returned \(rawSuggestions.count) suggestions, \(validatedSuggestions.count) passed validation")
-            return validatedSuggestions
+            print("✅ LLM returned \(rawSuggestions.count) suggestions")
+            return rawSuggestions
         } catch {
             print("❌ LLM API error: \(error)")
             print("🔄 Falling back to contextual mock suggestions...")
@@ -62,147 +58,7 @@ final class LLMService {
         }
     }
     
-    // NEW: Validate suggestions to prevent hallucinations
-    private func validateAndFilterSuggestions(_ suggestions: [LLMSuggestion], originalPrompt: String) -> [LLMSuggestion] {
-        return suggestions.compactMap { suggestion in
-            guard isValidSuggestion(suggestion, prompt: originalPrompt) else {
-                print("🚫 Filtered invalid suggestion: '\(suggestion.text)'")
-                return nil
-            }
-            return suggestion
-        }
-    }
-    
-    // NEW: Comprehensive validation to prevent hallucinations
-    private func isValidSuggestion(_ suggestion: LLMSuggestion, prompt: String) -> Bool {
-        let text = suggestion.text.trimmingCharacters(in: .whitespacesAndNewlines)
-        
-        // 1. Basic sanity checks
-        guard !text.isEmpty && text.count < 200 else { return false }
-        
-        // 2. Detect repetitive patterns (major source of hallucinations)
-        if hasRepetitivePattern(text) {
-            print("🚫 Repetitive pattern detected: '\(text)'")
-            return false
-        }
-        
-        // 3. Check for circular/nonsensical content
-        if hasCircularLogic(text) {
-            print("🚫 Circular logic detected: '\(text)'")
-            return false
-        }
-        
-        // 4. Ensure suggestion is actually relevant to the prompt
-        if !isRelevantToPrompt(text, prompt: prompt) {
-            print("🚫 Irrelevant to prompt: '\(text)'")
-            return false
-        }
-        
-        // 5. Check for placeholder/generic content
-        if isGenericPlaceholder(text) {
-            print("🚫 Generic placeholder detected: '\(text)'")
-            return false
-        }
-        
-        return true
-    }
-    
-    // NEW: Detect repetitive patterns
-    private func hasRepetitivePattern(_ text: String) -> Bool {
-        let words = text.components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }
-        
-        // Need at least 6 words to detect meaningful repetitive patterns
-        guard words.count >= 6 else { return false }
-        
-        // Check for repeated phrases
-        for i in 0..<words.count {
-            let maxLength = min(8, words.count - i)
-            // Only check if we have enough words for a meaningful pattern
-            guard maxLength >= 3 else { continue }
-            
-            for length in 3...maxLength {
-                let phrase = words[i..<i+length].joined(separator: " ")
-                let remainingStartIndex = i + length
-                
-                // Make sure we have remaining text to check
-                guard remainingStartIndex < words.count else { continue }
-                
-                let remainingText = words[remainingStartIndex...].joined(separator: " ")
-                
-                if remainingText.contains(phrase) {
-                    return true  // Found repetitive pattern
-                }
-            }
-        }
-        
-        // Check for too many repeated words
-        let wordCounts = Dictionary(grouping: words, by: { $0.lowercased() })
-        let maxWordCount = wordCounts.values.map { $0.count }.max() ?? 0
-        return maxWordCount > words.count / 3  // More than 1/3 are the same word
-    }
-    
-    // NEW: Detect circular logic
-    private func hasCircularLogic(_ text: String) -> Bool {
-        let lowerText = text.lowercased()
-        
-        // Common circular patterns
-        let circularPatterns = [
-            "when he became the",
-            "who was the.*who",
-            "that is the.*that",
-            "which was.*which"
-        ]
-        
-        return circularPatterns.contains { pattern in
-            lowerText.range(of: pattern, options: .regularExpression) != nil
-        }
-    }
-    
-    // NEW: Check relevance to prompt context
-    private func isRelevantToPrompt(_ text: String, prompt: String) -> Bool {
-        // For sentence completions, be more lenient
-        if text.count > 10 && text.contains(" ") {
-            return true  // Accept substantial sentence completions
-        }
-        
-        // Extract context clues from prompt
-        let promptKeywords = extractKeywords(from: prompt)
-        let suggestionKeywords = extractKeywords(from: text)
-        
-        // At least some overlap in keywords OR it's a reasonable completion
-        let intersection = promptKeywords.intersection(suggestionKeywords)
-        let hasOverlap = !intersection.isEmpty
-        let isShortCompletion = text.count < 30
-        let isReasonableText = text.contains(" ") || text.contains("@") || text.contains(".")
-        
-        let isRelevant = hasOverlap || isShortCompletion || isReasonableText
-        
-        if !isRelevant {
-            print("🔍 DEBUG: Relevance check failed for '\(text)'")
-            print("   Keywords in prompt: \(promptKeywords)")
-            print("   Keywords in suggestion: \(suggestionKeywords)")
-            print("   Intersection: \(intersection)")
-        }
-        
-        return isRelevant
-    }
-    
-    // NEW: Detect generic placeholders
-    private func isGenericPlaceholder(_ text: String) -> Bool {
-        let lowerText = text.lowercased()
-        let genericTerms = [
-            "example.com", "placeholder", "insert", "your", "here",
-            "lorem ipsum", "sample", "template", "default"
-        ]
-        
-        return genericTerms.contains { lowerText.contains($0) }
-    }
-    
-    private func extractKeywords(from text: String) -> Set<String> {
-        return Set(text.lowercased()
-            .components(separatedBy: .whitespacesAndNewlines)
-            .filter { $0.count > 3 && !["that", "this", "with", "from", "they", "were", "been", "have"].contains($0) })
-    }
+    // Validation helpers removed per request; return raw suggestions as-is
     
     // Call OpenAI API with improved error handling
     private func callOpenAI(prompt: String) async throws -> [LLMSuggestion] {
@@ -285,6 +141,7 @@ final class LLMService {
         3. ONLY use ACTUAL content from the user's recent activity
         4. Keep completions short and specific (under 100 characters preferred)
         5. If you don't have relevant context, suggest practical alternatives
+        6. Do NOT repeat text that already exists before the ____ marker; output ONLY the missing continuation after ____.
         
         BANNED PATTERNS:
         - "who was the X who was the X"

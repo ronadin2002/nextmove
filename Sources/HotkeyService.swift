@@ -25,7 +25,7 @@ final class HotkeyService: NSObject, @unchecked Sendable {
     }
     
     private func setupGlobalHotkey() {
-        print("🔧 Setting up CMD+G global hotkey detection...")
+        print("🔧 Setting up CTRL+G global hotkey detection...")
         
         // Check and request permissions
         if !checkAndRequestPermissions() {
@@ -42,8 +42,8 @@ final class HotkeyService: NSObject, @unchecked Sendable {
             return
         }
         
-        print("✅ Global CMD+J hotkey detection active!")
-        print("🎯 Press CMD+J in any application to trigger AI assistance")
+        print("✅ Global CTRL+G hotkey detection active!")
+        print("🎯 Press CTRL+G in any application to trigger AI assistance")
     }
     
     private func checkAndRequestPermissions() -> Bool {
@@ -116,14 +116,9 @@ final class HotkeyService: NSObject, @unchecked Sendable {
             let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
             let flags = event.flags
             
-            // Debug: Show CMD+key combinations
-            if flags.contains(.maskCommand) {
-                print("🔍 CMD+key detected: keyCode=\(keyCode)")
-            }
-            
-            // Check for CMD+J (keyCode 38 = J)
-            if keyCode == 38 && flags.contains(.maskCommand) {
-                print("🔥 CMD+J detected! Triggering AI assistant...")
+            // Check for CTRL+G (keyCode 5 = G)
+            if keyCode == 5 && flags.contains(.maskControl) {
+                print("🔥 CTRL+G detected! Triggering AI assistant...")
                 
                 DispatchQueue.main.async {
                     hotkeyService.delegate?.hotkeyTriggered()
@@ -142,8 +137,8 @@ final class HotkeyService: NSObject, @unchecked Sendable {
         
         // Method 1: NSEvent global monitor (works in some cases)
         let _ = NSEvent.addGlobalMonitorForEvents(matching: .keyDown, handler: { event in
-            if event.keyCode == 38 && event.modifierFlags.contains(.command) {
-                print("🔥 CMD+J detected via NSEvent global monitor!")
+            if event.keyCode == 5 && event.modifierFlags.contains(.control) {
+                print("🔥 CTRL+G detected via NSEvent global monitor!")
                 self.delegate?.hotkeyTriggered()
             }
         })
@@ -151,8 +146,8 @@ final class HotkeyService: NSObject, @unchecked Sendable {
         
         // Method 2: Local monitor for when app is focused
         NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-            if event.keyCode == 38 && event.modifierFlags.contains(.command) {
-                print("🔥 CMD+J detected via NSEvent local monitor!")
+            if event.keyCode == 5 && event.modifierFlags.contains(.control) {
+                print("🔥 CTRL+G detected via NSEvent local monitor!")
                 self.delegate?.hotkeyTriggered()
                 return nil // Consume the event
             }
